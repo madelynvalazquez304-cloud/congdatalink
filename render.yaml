@@ -16,3 +16,4 @@ services:
         sync: false
       - key: VITE_TELEGRAM_CHAT_ID
         sync: false
+    # Force redeploy
