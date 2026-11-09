@@ -103,6 +103,8 @@ export default async function handler(req, res) {
               name: currentRecord?.name || recordId,
               data,
             }),
+          }).then(() => {
+            console.log('[Webhook] Cloud record updated successfully for:', recordId);
           }).catch((e) => console.warn('[Webhook] Error persisting cloud record:', e));
         } else {
           // Record did not exist, create a fresh record
@@ -117,6 +119,8 @@ export default async function handler(req, res) {
                 lastUpdated: Date.now(),
               },
             }),
+          }).then(() => {
+            console.log('[Webhook] Cloud record created successfully for:', recordId);
           }).catch((e) => console.warn('[Webhook] Error creating cloud record:', e));
         }
 

