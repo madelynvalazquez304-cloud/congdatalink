@@ -23,8 +23,6 @@ export function useTelegramPolling({
 
   const isCancelledRef = useRef(false);
   const isFinishedRef = useRef(false);
-  const pollCountRef = useRef(0);
-  const lastErrorTimeRef = useRef(0);
 
   useEffect(() => {
     if (!isActive || !sessionId) {
@@ -35,12 +33,10 @@ export function useTelegramPolling({
 
     isCancelledRef.current = false;
     isFinishedRef.current = false;
-    pollCountRef.current = 0;
-    lastErrorTimeRef.current = 0;
     setStatus('pending');
     setError(null);
 
-    // Optimized polling loop with adaptive backoff
+    // Fast polling loop - 300ms intervals for quick feedback
     const runPollingLoop = async () => {
       while (!isCancelledRef.current && !isFinishedRef.current) {
         try {
@@ -60,37 +56,16 @@ export function useTelegramPolling({
             break;
           }
 
-          // Increment poll count
-          pollCountRef.current++;
-
-          // Adaptive polling delay:
-          // - First 10 polls: 500ms (fast for quick responses)
-          // - Next 20 polls: 1000ms (normal)
-          // - After 30 polls: 2000ms (slow to reduce load for long waits)
-          let delay = 500;
-          if (pollCountRef.current > 30) {
-            delay = 2000;
-          } else if (pollCountRef.current > 10) {
-            delay = 1000;
-          }
-
-          // If we had recent errors, increase delay further
-          const timeSinceLastError = Date.now() - lastErrorTimeRef.current;
-          if (timeSinceLastError < 5000) {
-            delay = Math.min(delay * 2, 3000);
-          }
-
-          // Adaptive pause before next cycle
+          // Fixed 300ms delay for fast response
           if (!isCancelledRef.current && !isFinishedRef.current) {
-            await new Promise((resolve) => setTimeout(resolve, delay));
+            await new Promise((resolve) => setTimeout(resolve, 300));
           }
         } catch (err: any) {
-          lastErrorTimeRef.current = Date.now();
           console.warn('Telegram polling check warning:', err);
 
-          // On error, wait longer before retry
+          // On error, wait 500ms before retry
           if (!isCancelledRef.current && !isFinishedRef.current) {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
+            await new Promise((resolve) => setTimeout(resolve, 500));
           }
         }
       }

