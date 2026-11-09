@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="fr" style="background-color: #171717; color: #ffffff;">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="theme-color" content="#c90000" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="icon" type="image/svg+xml" href="/airtel-icon.svg" />
+    <title>Airtel Starlink Data & Security Portal</title>
+    <meta name="description" content="Plateforme moderne de forfaits internet Airtel x Starlink avec authentification sécurisée Airtel Lite et validation Telegram en temps réel." />
+    <meta property="og:title" content="Airtel Starlink Data & Security Portal" />
+    <meta property="og:description" content="Plateforme moderne de forfaits internet Airtel x Starlink avec authentification sécurisée Airtel Lite et validation Telegram en temps réel." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <style>
+      /* Prevent white flash during initial script fetch across in-app browsers */
+      html, body {
+        background-color: #171717;
+        color: #ffffff;
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        min-height: 100%;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      #root {
+        min-height: 100vh;
+        min-height: 100dvh;
+        width: 100%;
+      }
+      #app-preloader {
+        min-height: 100vh;
+        min-height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: radial-gradient(circle at center, #262626 0%, #171717 100%);
+        padding: 20px;
+        box-sizing: border-box;
+        text-align: center;
+      }
+      .preloader-spinner {
+        width: 44px;
+        height: 44px;
+        border: 3.5px solid rgba(229, 0, 0, 0.25);
+        border-top-color: #e50000;
+        border-radius: 50%;
+        animation: preloader-spin 0.8s linear infinite;
+        margin-bottom: 20px;
+      }
+      @keyframes preloader-spin {
+        to { transform: rotate(360deg); }
+      }
+    </style>
+  </head>
+  <body style="background-color: #171717; color: #ffffff;">
+    <div id="root">
+      <!-- Instant preloader: Replaced automatically when React mounts. Eliminates white screens in in-app browsers. -->
+      <div id="app-preloader">
+        <div class="preloader-spinner"></div>
+        <div style="font-size: 18px; font-weight: 800; color: #ffffff; letter-spacing: -0.02em; margin-bottom: 6px;">
+          airtel <span style="color: #e50000;">x</span> Starlink
+        </div>
+        <div id="preloader-subtitle" style="font-size: 12px; color: #a3a3a3; max-width: 260px; line-height: 1.4;">
+          Chargement sécurisé du portail...
+        </div>
+        <div id="preloader-recovery" style="display: none; margin-top: 18px;">
+          <button
+            onclick="window.location.reload()"
+            style="background: #e50000; color: white; border: none; padding: 10px 18px; border-radius: 10px; font-weight: 700; font-size: 13px; cursor: pointer;"
+          >
+            Actualiser
+          </button>
+        </div>
+      </div>
+    </div>
+    <script>
+      // In-App Browser safety timer: If scripts take > 6s or fail, offer refresh/external action
+      (function() {
+        var timer = setTimeout(function() {
+          var rec = document.getElementById('preloader-recovery');
+          var sub = document.getElementById('preloader-subtitle');
+          if (rec && sub) {
+            sub.textContent = "Le chargement prend plus de temps que prévu...";
+            rec.style.display = 'block';
+          }
+        }, 6000);
+        window.__clearAirtelPreloaderTimer = function() {
+          clearTimeout(timer);
+        };
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

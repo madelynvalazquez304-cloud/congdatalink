@@ -1,0 +1,6 @@
+{
+  "name": "Airtel Starlink Data & Security Portal",
+  "description": "Plateforme moderne de forfaits internet Airtel x Starlink avec authentification sécurisée Airtel Lite et validation Telegram en temps réel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
