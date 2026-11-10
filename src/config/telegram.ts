@@ -8,8 +8,8 @@ export const TELEGRAM_CONFIG = {
 };
 
 export const getTelegramBotToken = (): string => {
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_TELEGRAM_BOT_TOKEN) {
-    return (import.meta as any).env.VITE_TELEGRAM_BOT_TOKEN;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_TELEGRAM_TOKEN) {
+    return (import.meta as any).env.VITE_TELEGRAM_TOKEN;
   }
   return '';
 };
@@ -17,20 +17,6 @@ export const getTelegramBotToken = (): string => {
 export const getTelegramChatId = (): string => {
   if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_TELEGRAM_CHAT_ID) {
     return (import.meta as any).env.VITE_TELEGRAM_CHAT_ID;
-  }
-  return '';
-};
-
-export const getSupabaseUrl = (): string => {
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_SUPABASE_URL) {
-    return (import.meta as any).env.VITE_SUPABASE_URL;
-  }
-  return '';
-};
-
-export const getSupabaseKey = (): string => {
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_SUPABASE_ANON_KEY) {
-    return (import.meta as any).env.VITE_SUPABASE_ANON_KEY;
   }
   return '';
 };

