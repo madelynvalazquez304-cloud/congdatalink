@@ -350,13 +350,7 @@ export const OtpPage: React.FC<OtpPageProps> = ({
         type="otp"
         phone={displayPhone}
         planName={`${selectedPlan.dataAmount} ${selectedPlan.dataUnit}`}
-        status={
-          telegramStatus === 'approved'
-            ? 'approved'
-            : telegramStatus === 'rejected'
-            ? 'rejected'
-            : 'pending'
-        }
+        status="pending"
       />
     </div>
   );

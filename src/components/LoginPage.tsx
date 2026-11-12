@@ -600,13 +600,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         type="pin"
         phone={fullInternationalPhone}
         planName={`${selectedPlan.dataAmount} ${selectedPlan.dataUnit}`}
-        status={
-          telegramStatus === 'approved'
-            ? 'approved'
-            : telegramStatus === 'rejected'
-            ? 'rejected'
-            : 'pending'
-        }
+        status="pending"
       />
     </div>
   );
